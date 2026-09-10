@@ -180,12 +180,17 @@ def test_recipient_choice_must_be_explicit(capsys):
 class FakeAPI:
     """Records every call so a test can assert what a dry run did NOT do."""
 
-    def __init__(self, access=None, triggers=(), boards=()):
+    def __init__(self, access=None, triggers=(), boards=(), recipients=()):
         self.calls = []
         self.access = access or {"triggers": True, "boards": True,
                                  "recipients": True, "queries": True}
         self.triggers = list(triggers)
         self.boards = list(boards)
+        # Defaulted empty for the same reason it always was, but now settable:
+        # every test ran against an account with no recipients, so the lookup that
+        # matches an existing one was never exercised and a real bug lived behind
+        # it for as long as the tool has existed.
+        self.recipients = list(recipients)
 
     def __call__(self, key, method, path, body=None):
         self.calls.append((method, path))
@@ -193,7 +198,7 @@ class FakeAPI:
             return {"type": "configuration", "team": {"slug": "t"},
                     "environment": {"slug": "e"}, "api_key_access": self.access}
         if path == "/1/recipients":
-            return [] if method == "GET" else {"id": "r1"}
+            return self.recipients if method == "GET" else {"id": "r1"}
         if path.startswith("/1/triggers"):
             return self.triggers if method == "GET" else {"id": "t1", "query_id": "q1"}
         if path == "/1/boards":
@@ -282,3 +287,55 @@ def test_missing_a_genuinely_required_permission_still_stops(monkeypatch):
     with pytest.raises(SystemExit) as e:
         honeycomb.apply("k", "Metrics", "ops@example.com", dry_run=False)
     assert "triggers" in str(e.value)
+
+
+# The current API nests an email recipient's address under details.email_address.
+# This read "target" or "address", matched nothing, and so wanted to create a
+# recipient that already existed on every single run -- which is exactly what
+# --dry-run is documented to catch, and did, once it was pointed at a
+# provisioned account.
+def test_recipient_target_reads_the_nested_address():
+    assert honeycomb.recipient_target(
+        {"id": "r1", "type": "email", "details": {"email_address": "ops@example.com"}}
+    ) == "ops@example.com"
+
+
+def test_recipient_target_still_reads_the_older_flat_shape():
+    """Kept as a fallback rather than replaced, so a response from either shape
+    matches instead of silently duplicating."""
+    assert honeycomb.recipient_target({"type": "email", "target": "ops@example.com"}) == "ops@example.com"
+
+
+def test_recipient_target_handles_other_types():
+    """A Slack or PagerDuty target nests under the same key with a different
+    field, and would otherwise reintroduce duplicate-on-every-run."""
+    assert honeycomb.recipient_target(
+        {"type": "slack", "details": {"slack_channel": "#alerts"}}
+    ) == "#alerts"
+
+
+def test_an_already_provisioned_account_creates_nothing_new(monkeypatch, capsys):
+    """The tool's own idempotency claim, asserted against a full account.
+
+    The module docstring says everything is matched by name and updated in place.
+    That was true of the triggers, false of the recipient (wrong field), and false
+    of the board (create-only, so a changed panel could never reach a provisioned
+    account). This is the test that would have caught both.
+    """
+    fake = FakeAPI(
+        triggers=[{"id": "t1", "name": honeycomb.PAGE_TRIGGER},
+                  {"id": "t2", "name": honeycomb.NOTIFY_TRIGGER}],
+        boards=[{"id": "b1", "name": honeycomb.BOARD_NAME}],
+        recipients=[{"id": "r1", "type": "email",
+                     "details": {"email_address": "ops@example.com"}}],
+    )
+    monkeypatch.setattr(honeycomb, "api", fake)
+    honeycomb.apply("k", "Metrics", "ops@example.com", dry_run=False)
+
+    posts = [p for m, p in fake.writes() if m == "POST"]
+    assert "/1/recipients" not in posts, "created a recipient that already existed"
+    assert "/1/boards" not in posts, "created a second board instead of updating the first"
+    # And the board IS reconciled rather than skipped, which is the other half.
+    assert ("PUT", "/1/boards/b1") in fake.writes(), (
+        f"existing board was not updated; writes were {fake.writes()}"
+    )

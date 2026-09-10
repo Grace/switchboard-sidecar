@@ -23,7 +23,9 @@ Three behaviours here are not incidental, and each one is a bruise:
 Re-running is safe. Everything is matched by name and updated in place. That is
 not tidiness: the Honeycomb free plan allows two triggers per team, so a second
 blind create *cannot* succeed, and a provisioning tool that only works against an
-empty account is a tool you cannot run twice.
+empty account is a tool you cannot run twice. The board was the exception to this
+for longer than it should have been -- it was created once and thereafter skipped,
+so a changed panel never reached a provisioned account.
 
 Failures print the API's own words. Tooling in front of this API reported
 "Failed to save trigger" for a plan-limit rejection and for an invalid
@@ -306,6 +308,31 @@ plan allows two triggers in total. The page names its own cause; the notify trig
 counters and cannot say which moved, so the first panel below is the answer."""
 
 
+def recipient_target(r: dict) -> str | None:
+    """Where a recipient's address actually lives in the API response.
+
+    This read `target` or `address` and matched nothing, so every run wanted to
+    create a recipient that already existed -- the tool was not idempotent, which
+    is precisely what --dry-run exists to catch and duly did. The current API
+    nests it: an email recipient carries `details.email_address`, and the flat
+    fields are from an older shape.
+
+    Kept as a fallback chain rather than one lookup because the other recipient
+    types nest differently under the same key, and a Slack or PagerDuty target
+    would otherwise reintroduce the same duplicate-on-every-run behaviour the
+    moment one is used.
+    """
+    d = r.get("details") or {}
+    return (
+        d.get("email_address")
+        or d.get("slack_channel")
+        or d.get("pagerduty_integration_name")
+        or d.get("webhook_name")
+        or r.get("target")
+        or r.get("address")
+    )
+
+
 def find_by_name(items, name: str):
     """Exact-name match, or None. The whole idempotency story rests on this.
 
@@ -359,7 +386,7 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
     if recipient:
         listed = api(key, "GET", "/1/recipients") or []
         existing = find_by_name(
-            [{**r, "name": r.get("target") or r.get("address")} for r in listed], recipient
+            [{**r, "name": recipient_target(r)} for r in listed], recipient
         )
         if existing:
             print(f"recipient exists: {recipient}")
@@ -399,67 +426,78 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
             unverified.append(spec["name"])
 
     boards = api(key, "GET", "/1/boards") or []
-    if find_by_name(boards, BOARD_NAME):
-        print(f"board exists: {BOARD_NAME}")
-    else:
-        panels = [
+    existing_board = find_by_name(boards, BOARD_NAME)
+    # Reconciled rather than skipped. This used to print "board exists" and stop,
+    # which meant a panel or caption changed in this file could never reach an
+    # account that had already been provisioned -- and the module docstring above
+    # claimed everything was "matched by name and updated in place". It was true
+    # of the triggers and the recipient and false of the board, so the one object
+    # a deployer would notice going stale was the one that never updated. The
+    # live board spent two days explaining a defect that had been fixed.
+    #
+    # The cost, named because Honeycomb does not collect it: a saved query is
+    # immutable, so an update mints new queries and annotations and the previous
+    # ones are left in the account unreferenced. Five of each per update. That is
+    # worth less than a board that silently never changes, but it is not free.
+    panels = [
+        {
+            "type": "text",
+            "position": {"x_coordinate": 0, "y_coordinate": 0, "width": 12, "height": 5},
+            "text_panel": {"content": BOARD_TEXT},
+        }
+    ]
+    for i, (name, desc, spec) in enumerate(board_queries()):
+        # Behind write(), not around it. A board panel needs a saved query and
+        # an annotation to point at, and creating those is as much a write as
+        # creating the board: they are named objects that persist in the
+        # account whether or not a board ever references them. Issuing them
+        # during a dry run left five orphaned annotations per run and printed
+        # nothing about it, which makes a flag documented as "writing nothing"
+        # a false statement rather than an imprecise one.
+        q = write("create query", name, lambda spec=spec:
+                  api(key, "POST", f"/1/queries/{dataset}", spec))
+        ann = write("create query annotation", name, lambda name=name, desc=desc, q=q:
+                    api(key, "POST", f"/1/query_annotations/{dataset}",
+                        {"name": name, "description": desc, "query_id": q["id"]}))
+        if q is None or ann is None:
+            # Dry run: there is no id to build a panel around, and inventing a
+            # placeholder would produce a "would create" report describing a
+            # board that could not be built from it.
+            continue
+        panels.append(
             {
-                "type": "text",
-                "position": {"x_coordinate": 0, "y_coordinate": 0, "width": 12, "height": 5},
-                "text_panel": {"content": BOARD_TEXT},
+                "type": "query",
+                "position": {
+                    "x_coordinate": 0 if i % 2 == 0 else 6,
+                    "y_coordinate": 5 + (i // 2) * 4,
+                    "width": 6,
+                    "height": 4,
+                },
+                "query_panel": {
+                    "query_id": q["id"],
+                    "query_annotation_id": ann["id"],
+                    "query_style": "combo",
+                    "dataset": dataset,
+                },
             }
-        ]
-        for i, (name, desc, spec) in enumerate(board_queries()):
-            # Behind write(), not around it. A board panel needs a saved query and
-            # an annotation to point at, and creating those is as much a write as
-            # creating the board: they are named objects that persist in the
-            # account whether or not a board ever references them. Issuing them
-            # during a dry run left five orphaned annotations per run and printed
-            # nothing about it, which makes a flag documented as "writing nothing"
-            # a false statement rather than an imprecise one.
-            q = write("create query", name, lambda spec=spec:
-                      api(key, "POST", f"/1/queries/{dataset}", spec))
-            ann = write("create query annotation", name, lambda name=name, desc=desc, q=q:
-                        api(key, "POST", f"/1/query_annotations/{dataset}",
-                            {"name": name, "description": desc, "query_id": q["id"]}))
-            if q is None or ann is None:
-                # Dry run: there is no id to build a panel around, and inventing a
-                # placeholder would produce a "would create" report describing a
-                # board that could not be built from it.
-                continue
-            panels.append(
-                {
-                    "type": "query",
-                    "position": {
-                        "x_coordinate": 0 if i % 2 == 0 else 6,
-                        "y_coordinate": 5 + (i // 2) * 4,
-                        "width": 6,
-                        "height": 4,
-                    },
-                    "query_panel": {
-                        "query_id": q["id"],
-                        "query_annotation_id": ann["id"],
-                        "query_style": "combo",
-                        "dataset": dataset,
-                    },
-                }
-            )
-        made = write("create board", BOARD_NAME, lambda: api(
-            key,
-            "POST",
-            "/1/boards",
-            {
-                "name": BOARD_NAME,
-                "description": "What the two triggers cannot tell you: which counter moved, "
-                "and what the gateway was doing when it did.",
-                "type": "flexible",
-                "panels": panels,
-                "tags": [{"key": "service", "value": "switchboard"}],
-            },
-        ))
-        if made:
-            print(f"board created: {made['links']['board_url']}")
-            changed.append(BOARD_NAME)
+        )
+    body = {
+        "name": BOARD_NAME,
+        "description": "What the two triggers cannot tell you: which counter moved, "
+        "and what the gateway was doing when it did.",
+        "type": "flexible",
+        "panels": panels,
+        "tags": [{"key": "service", "value": "switchboard"}],
+    }
+    verb, method, path = (
+        ("update board", "PUT", f"/1/boards/{existing_board['id']}")
+        if existing_board
+        else ("create board", "POST", "/1/boards")
+    )
+    made = write(verb, BOARD_NAME, lambda: api(key, method, path, body))
+    if made:
+        print(f"board {verb.split()[0]}d: {made['links']['board_url']}")
+        changed.append(BOARD_NAME)
 
     if unverified:
         # Loud, itemised, and last, so it is the part still on screen. Saying
