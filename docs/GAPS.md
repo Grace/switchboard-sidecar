@@ -481,6 +481,17 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    took to notice, which is the failure mode this file exists to prevent, so it
    is worth saying plainly rather than quietly editing.
 
+   **Both known causes are now gone, and the reading is still unverified.** The
+   floor is 5 ms and the local rejections that made up about half the traffic are
+   out of this population entirely, so the two mechanisms that produced -100 and
+   -5 are both addressed. Nothing has been measured since: item 23 renamed the
+   metric to `gen_ai.server.request.duration` in seconds and the stack was torn
+   down before any traffic ran against it, so the P50 figure above is the last
+   real observation and describes a histogram that no longer exists under that
+   name. Whether percentiles now read correctly needs one deployment's worth of
+   traffic to say, and until then the honest claim is that the causes were
+   removed rather than that the numbers are trustworthy.
+
    The structural residue above still applies to whatever remains below the
    lowest bound, and the numbers quoted are from before the fix. They have not
    been re-measured against real traffic, because there is none. Read the tail

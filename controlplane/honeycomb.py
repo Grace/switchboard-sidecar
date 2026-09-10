@@ -275,15 +275,24 @@ def board_queries() -> list[tuple[str, str, dict]]:
     """
     out = [(p.title, p.caption, sums(*p.metrics)) for p in alerting.PANELS]
     out.append((
-        "Request duration (shape only)",
-        "The counts are right and the shape is readable. Percentiles are not: traffic below the "
-        "lowest bucket bound falls in a bucket with no lower edge, so a percentile there "
-        "extrapolates below zero and reports a negative duration.",
+        "Request duration by provider",
+        "Seconds, not milliseconds: this follows the GenAI conventions, which specify seconds. "
+        "Both known causes of the negative percentiles this panel used to show are fixed -- the "
+        "bucket floor moved from 100ms to 5ms, and requests that never reached a provider are no "
+        "longer in this population at all -- but whether the percentiles now read correctly has "
+        "not been confirmed against real traffic, so treat the shape as the reliable part. "
+        "A request that failed over is attributed to the provider that answered while its "
+        "duration includes the ones that did not, which is what the caller waited and is not a "
+        "per-provider service time.",
         {
             # Not through column(): LATENCY_METRIC is already a full column
             # name from the GenAI conventions, and prefixing it would produce
             # switchboard.gen_ai.server.request.duration, which nothing emits.
             "calculations": [{"column": alerting.LATENCY_METRIC, "op": "HEATMAP"}],
+            # The reason the metric was dimensioned. Before this the histogram
+            # was one global number and no per-provider comparison could be
+            # drawn at all.
+            "breakdowns": ["gen_ai.provider.name"],
             "time_range": 86400,
         },
     ))
