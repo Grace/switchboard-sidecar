@@ -259,6 +259,69 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     key is unavailable. Making the deadline visible was the part whose absence
     turned a documented limit into a surprise.
 
+23. **The telemetry named two of four providers off-enum, and threw away every
+    token count.** Switchboard emits the OpenTelemetry GenAI conventions
+    natively rather than a dialect, so the normalizers that translate one into
+    the other -- `genainormalizerprocessor` upstream, and `genai-interlingua` --
+    do not apply to it. Checking that claim found four defects instead.
+
+    **`gen_ai.provider.name` carried our own identifiers.** Two of the four also
+    happen to be the convention's values; `gemini` and `bedrock` are not, and
+    the enum says `gcp.gemini` and `aws.bedrock`. This fails silently: nothing
+    rejects an off-enum value, so that traffic simply stopped grouping with
+    everything else those providers serve, on the attribute the conventions name
+    as the discriminator the rest of the span is read through. The identifiers
+    cannot move -- `controlplane/app.py` validates them as a `Literal`, signed
+    policies carry them, `policy.go` enforces them -- so the translation sits at
+    the OTLP boundary. Gemini is `gcp.gemini` and not `gcp.vertex_ai` because the
+    registry scopes that value to `generativelanguage.googleapis.com`, which is
+    the endpoint `adapter.go` calls.
+
+    **`gen_ai.operation.name` was absent**, and it is the one attribute marked
+    Required on both the span and the token metric. It is per provider, not a
+    constant: a well-known value MUST be used where one applies, so Gemini's
+    `generateContent` is `generate_content` and the other three are `chat`,
+    Bedrock's Converse included.
+
+    **Token counts were computed for every provider and dropped.**
+    `adapter.go` has always normalised four incompatible usage shapes into one
+    set of numbers, including Anthropic's three-way cache split where reading
+    `input_tokens` alone under-counts without bound. They fed a single integrity
+    check and went nowhere else, so nothing downstream could say what a request
+    cost. They now travel as `gen_ai.usage.*`, and the cache parts are kept
+    beside the sum they belong to: the sum is the billing figure, the parts are
+    what say whether caching is working, and a total alone cannot tell a warm
+    prompt from a cold one. An output of zero is reported rather than suppressed,
+    because a reasoning model spending its whole budget before writing a word is
+    exactly what this gateway exists to notice.
+
+    **Every metric was one undimensioned number.** No per-provider cost, latency
+    or failure reading existed anywhere, and that -- not the name -- was what
+    blocked the rename: `gen_ai.server.request.duration` requires
+    `gen_ai.operation.name` and `gen_ai.provider.name`, and a conformant name
+    over data missing the attributes it requires is worse than an obviously
+    custom one. It is the `bedrock` defect again, moved to metrics. So the
+    histogram is now keyed by provider, model and `error.type`, renamed, and
+    converted to seconds at the OTLP boundary; `gen_ai.client.token.usage` rides
+    the same keys. `switchboard.request_duration_milliseconds` is gone from OTLP
+    and any board, query or trigger built on it has to be recreated.
+
+    The route table is capped at 128 keys carrying a model, because models
+    arrive from signed policies and that key space has no bound of its own.
+    Past the cap an observation folds onto its provider rather than being
+    dropped: losing a dimension beats losing the measurement, and a counter says
+    the detail is missing rather than leaving a silent hole.
+
+    **What did not change, and why.** `switchboard.attempts`, `switchboard.fault`
+    and `switchboard.policy_version` stay where they are. `gen-ai-spans.md`,
+    `gen-ai-agent-spans.md` and `gen-ai-metrics.md` were read directly: there is
+    still no gateway, router, failover or retry convention, so item 18's
+    reasoning holds. The loopback `/metrics` endpoint also keeps its milliseconds
+    and its name; OTel semconv governs the OTLP surface, Prometheus exposition
+    has its own rules, and nothing scrapes that endpoint in a shipped
+    deployment. The cost of that choice is that one measurement now has two
+    names and two units depending on which surface you read.
+
 ## Still open
 
 1. **Deployment is proven for the quickstart only.** `quickstart.yaml` has been
@@ -378,7 +441,8 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    none, which was worse than having no trigger because it read as coverage.
 
    **Latency percentiles are unusable, and the histogram is not at fault.**
-   `P50`, `P95` and `P99` on `switchboard.request_duration_milliseconds` all
+   `P50`, `P95` and `P99` on `switchboard.request_duration_milliseconds` (since
+   renamed to `gen_ai.server.request.duration`, in seconds -- see item 23) all
    return **-100 ms**. A duration cannot be negative, but the encoding is
    correct: `HISTOGRAM_COUNT` returns exactly `requests_total`, so every
    observation is accounted for. The cause is `latencyBounds` in

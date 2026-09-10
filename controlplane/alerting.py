@@ -180,7 +180,14 @@ PANELS = (
 # emitters aggregate it differently. Its percentiles are not currently
 # trustworthy: traffic below the lowest bucket bound lands in a bucket with no
 # lower edge, so a percentile there extrapolates below zero. See docs/GAPS.md.
-LATENCY_METRIC = "request_duration_milliseconds"
+#
+# Unlike every counter here this is a FULL column name, not a suffix the emitter
+# prefixes with "switchboard.". It follows the OpenTelemetry GenAI conventions,
+# which own this measurement and name it in seconds; the counters describe
+# routing, which no convention covers, and keep their own namespace. Anything
+# built on the old switchboard.request_duration_milliseconds column stops
+# resolving and has to be recreated.
+LATENCY_METRIC = "gen_ai.server.request.duration"
 
 OVERVIEW = """Two things to know before reading an alert from this service.
 

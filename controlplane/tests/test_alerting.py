@@ -33,15 +33,26 @@ def gateway_series() -> set[str]:
     # log_dropped_total is appended conditionally, outside the literal.
     tail = src[src.index("m.LogDropped != nil"):]
     names.add(re.search(r'series\{"([a-z_]+)", "counter"', tail).group(1))
-    names.add("request_duration_milliseconds")
     return names
+
+
+def gateway_histograms() -> set[str]:
+    """The histogram names the gateway exports over OTLP.
+
+    They are not in series(): a histogram needs a different OTLP shape, so it is
+    built separately in routeHistograms(). These are full names following the
+    GenAI conventions rather than suffixes the emitter prefixes, which is why
+    they are read apart from the counters.
+    """
+    src = (REPO / "internal/gateway/telemetry.go").read_text()
+    block = src[src.index("func (t *Telemetry) routeHistograms("):]
+    return set(re.findall(r'"name": "(gen_ai\.[a-z_.]+)"', block))
 
 
 def referenced() -> set[str]:
     names = {c.metric for c in alerting.CONDITIONS}
     names |= {m for p in alerting.PANELS for m in p.metrics}
     names |= set(alerting.NOT_ALERTED)
-    names.add(alerting.LATENCY_METRIC)
     return names
 
 
@@ -51,6 +62,32 @@ def test_every_referenced_metric_exists_in_the_gateway():
         f"alerting.py names metrics the gateway does not publish: {sorted(missing)}. "
         "An alert on a nonexistent metric is accepted by every backend here and never fires."
     )
+
+
+def test_latency_column_matches_the_gateway():
+    """The rename that broke every existing query on this column.
+
+    LATENCY_METRIC is a full column name from the GenAI conventions, so it is
+    checked against the histograms the gateway builds rather than against
+    series(). A name that drifts here produces a heatmap over a column nothing
+    emits, which renders as an empty panel rather than as an error.
+    """
+    assert alerting.LATENCY_METRIC in gateway_histograms(), (
+        f"{alerting.LATENCY_METRIC} is not exported by the gateway; "
+        f"it publishes {sorted(gateway_histograms())}"
+    )
+
+
+def test_latency_column_is_not_prefixed_by_the_emitter():
+    """column() prepends switchboard. and must not be applied to this one."""
+    board = honeycomb.board_queries()
+    heatmaps = [
+        c["column"]
+        for _, _, q in board
+        for c in q["calculations"]
+        if c["op"] == "HEATMAP"
+    ]
+    assert heatmaps == [alerting.LATENCY_METRIC], heatmaps
 
 
 def test_definitions_carry_no_prefix():

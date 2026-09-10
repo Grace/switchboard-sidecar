@@ -280,7 +280,10 @@ def board_queries() -> list[tuple[str, str, dict]]:
         "lowest bucket bound falls in a bucket with no lower edge, so a percentile there "
         "extrapolates below zero and reports a negative duration.",
         {
-            "calculations": [{"column": column(alerting.LATENCY_METRIC), "op": "HEATMAP"}],
+            # Not through column(): LATENCY_METRIC is already a full column
+            # name from the GenAI conventions, and prefixing it would produce
+            # switchboard.gen_ai.server.request.duration, which nothing emits.
+            "calculations": [{"column": alerting.LATENCY_METRIC, "op": "HEATMAP"}],
             "time_range": 86400,
         },
     ))

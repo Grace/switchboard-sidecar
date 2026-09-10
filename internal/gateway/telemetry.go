@@ -106,6 +106,129 @@ type Metrics struct {
 	CaptureFull, IdemFull atomic.Int64
 	LatencyBuckets        [len(latencyBounds)]atomic.Int64
 	LogDropped            *atomic.Int64
+	// RouteKeysFolded counts observations that arrived after the route table was
+	// full and were recorded without their model. See routeTable.
+	RouteKeysFolded atomic.Int64
+	routes          routeTable
+}
+
+// The conventions' request-duration and token-usage metrics both require
+// attributes that a single global counter cannot carry: at minimum the provider
+// and the operation, and for tokens whether the count is input or output. Every
+// metric this gateway exported was one undimensioned number, so there was no
+// per-provider cost, latency or failure reading anywhere -- and no honest way to
+// name one of them gen_ai.*, because a conformant name over data missing the
+// attributes that name requires is worse than an obviously custom one.
+//
+// Keyed here rather than by promoting the flat counters, which are read on paths
+// that have no route in hand and are a stable query surface of their own.
+type routeKey struct {
+	provider, model string
+	// errorType is "" on success. It is the conventions' error.type, which is
+	// Conditionally Required on the duration metric when the operation failed.
+	errorType string
+}
+
+type routeLatency struct {
+	buckets [len(latencyBounds)]atomic.Int64
+	sumMS   atomic.Int64
+	count   atomic.Int64
+	// Token totals, kept on the same key so one lookup serves both metrics.
+	// Split by the conventions' gen_ai.token.type at export rather than stored
+	// twice.
+	inputTokens, outputTokens atomic.Int64
+}
+
+// routeMaxKeys bounds the number of keys that carry a model. Models arrive from
+// signed policies, which change over the life of a process, so that part of the
+// key space has no bound of its own and an unbounded metric map is a memory leak
+// with a slow fuse.
+//
+// The table can hold a few more than this: once the cap is reached, further
+// models fold onto a per-provider key, and those are bounded separately and much
+// more tightly -- provider is a closed four-value set that policy.go enforces,
+// and error.type comes from the fixed set of statuses fail() uses. The total is
+// therefore routeMaxKeys plus a small constant, not routeMaxKeys exactly.
+const routeMaxKeys = 128
+
+type routeTable struct {
+	mu sync.RWMutex
+	m  map[routeKey]*routeLatency
+}
+
+// get returns the aggregate for a route, creating it if there is room.
+//
+// Past the cap the model is dropped and the observation is folded onto the
+// provider, rather than discarded. Losing one dimension is much better than
+// losing the measurement: a fleet that trips this still reports correct totals
+// per provider, and RouteKeysFolded says the detail is missing rather than
+// leaving a silent hole. Provider is a closed four-value set that policy.go
+// enforces, so the folded key cannot itself grow without bound.
+func (t *routeTable) get(k routeKey, folded *atomic.Int64) *routeLatency {
+	t.mu.RLock()
+	r, ok := t.m[k]
+	t.mu.RUnlock()
+	if ok {
+		return r
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Re-check: another goroutine may have created it between the two locks.
+	if r, ok := t.m[k]; ok {
+		return r
+	}
+	if t.m == nil {
+		t.m = map[routeKey]*routeLatency{}
+	}
+	if len(t.m) >= routeMaxKeys && k.model != "" {
+		folded.Add(1)
+		k.model = ""
+		if r, ok := t.m[k]; ok {
+			return r
+		}
+	}
+	r = &routeLatency{}
+	t.m[k] = r
+	return r
+}
+
+// snapshot copies the table for export. Values are read under the lock but are
+// individually atomic, so this is a consistent set of keys rather than a
+// consistent instant -- which is what a cumulative histogram needs.
+func (t *routeTable) snapshot() map[routeKey]*routeLatency {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make(map[routeKey]*routeLatency, len(t.m))
+	for k, v := range t.m {
+		out[k] = v
+	}
+	return out
+}
+
+// ObserveRoute records one completed inference against its route.
+//
+// Called beside ObserveLatency rather than replacing it: the flat histogram
+// still backs the Prometheus endpoint, and the duplicated bucket walk costs
+// nine comparisons on a path that just spent hundreds of milliseconds talking
+// to a provider.
+func (m *Metrics) ObserveRoute(provider, model string, status int, ms int64, u tokenUsage) {
+	k := routeKey{provider: provider, model: model}
+	// Matches the span: error.type is the status code, which is the honest
+	// taxonomy here because every fail() picks a distinct status for a distinct
+	// cause.
+	if status >= 400 {
+		k.errorType = strconv.Itoa(status)
+	}
+	r := m.routes.get(k, &m.RouteKeysFolded)
+	r.sumMS.Add(ms)
+	r.count.Add(1)
+	for i, b := range latencyBounds {
+		if ms <= b {
+			r.buckets[i].Add(1)
+		}
+	}
+	r.inputTokens.Add(int64(u.Input))
+	r.outputTokens.Add(int64(u.Output))
 }
 
 // The first bucket of an explicit-bounds histogram has no lower bound, so
@@ -662,9 +785,10 @@ func (t *Telemetry) remove(sp spooled) {
 // is an opt-in sidecar absent from both CloudFormation templates and the sample
 // task definition. Without this, every counter here is unreadable in production.
 //
-// Histograms are deliberately not exported. The latency histogram needs a
-// different OTLP shape and bucket encoding, and claiming histogram support
-// without it would be worse than omitting it.
+// Two histograms go out beside the counters, both dimensioned per route:
+// gen_ai.server.request.duration and gen_ai.client.token.usage. The comment
+// here used to say histograms were deliberately not exported, which stopped
+// being true the moment one was added twenty lines below it.
 func (t *Telemetry) exportMetrics(ctx context.Context) {
 	now := strconv.FormatInt(time.Now().UnixNano(), 10)
 	start := strconv.FormatInt(t.start.UnixNano(), 10)
@@ -682,7 +806,7 @@ func (t *Telemetry) exportMetrics(ctx context.Context) {
 		}
 		metrics = append(metrics, m)
 	}
-	metrics = append(metrics, t.latencyHistogram(now, start))
+	metrics = append(metrics, t.routeHistograms(now, start)...)
 	body := map[string]any{"resourceMetrics": []any{map[string]any{
 		"resource":     map[string]any{"attributes": []any{map[string]any{"key": "service.name", "value": map[string]any{"stringValue": "switchboard-gateway"}}}},
 		"scopeMetrics": []any{map[string]any{"scope": map[string]any{"name": "switchboard", "version": "1.0.0"}, "metrics": metrics}},
@@ -706,10 +830,10 @@ func (t *Telemetry) exportMetrics(ctx context.Context) {
 	}
 }
 
-// latencyHistogram encodes the request-duration histogram for OTLP.
+// routeHistograms encodes the two per-route histograms the conventions define.
 //
 // The one thing here that is easy to get silently wrong: Prometheus buckets are
-// cumulative and OTLP bucketCounts are not. LatencyBuckets[i] holds every request
+// cumulative and OTLP bucketCounts are not. Our buckets[i] holds every request
 // at or below latencyBounds[i], including all earlier buckets, while OTLP wants
 // the count falling within each bucket plus one overflow bucket. Emitting the
 // cumulative values directly would produce a plausible-looking histogram that is
@@ -717,45 +841,117 @@ func (t *Telemetry) exportMetrics(ctx context.Context) {
 //
 // len(bucketCounts) must be exactly len(explicitBounds)+1 or consumers reject or
 // misread the point.
-func (t *Telemetry) latencyHistogram(now, start string) map[string]any {
-	// Read each counter once. They are individually atomic but not a consistent
-	// snapshot, so differencing re-read values could produce nonsense.
-	cumulative := make([]int64, len(latencyBounds))
-	for i := range latencyBounds {
-		cumulative[i] = t.m.LatencyBuckets[i].Load()
+//
+// Durations are stored in milliseconds and the convention specifies seconds, so
+// bounds and sums are divided here and only here. A factor of a thousand is the
+// whole risk in this function and it is invisible to anything checking the name.
+func (t *Telemetry) routeHistograms(now, start string) []any {
+	routes := t.m.routes.snapshot()
+	if len(routes) == 0 {
+		return nil
 	}
-	count := t.m.Completed.Load()
-	sum := t.m.LatencyMS.Load()
-
-	counts := make([]string, 0, len(latencyBounds)+1)
-	prev := int64(0)
-	for _, c := range cumulative {
-		// Clamped: a request completing between two of the loads above can leave
-		// a difference momentarily negative, which is not a real value.
-		counts = append(counts, strconv.FormatInt(max(c-prev, 0), 10))
-		prev = c
-	}
-	counts = append(counts, strconv.FormatInt(max(count-prev, 0), 10)) // the +Inf bucket
-
 	bounds := make([]any, 0, len(latencyBounds))
 	for _, b := range latencyBounds {
-		bounds = append(bounds, b)
+		bounds = append(bounds, float64(b)/1000)
 	}
-	return map[string]any{
-		"name": "switchboard.request_duration_milliseconds",
-		"unit": "ms",
-		"histogram": map[string]any{
-			"aggregationTemporality": 2,
-			"dataPoints": []any{map[string]any{
+	duration := make([]any, 0, len(routes))
+	tokens := make([]any, 0, 2*len(routes))
+	for k, r := range routes {
+		// Read each counter once. They are individually atomic but not a
+		// consistent snapshot, so differencing re-read values could produce
+		// nonsense.
+		cumulative := make([]int64, len(latencyBounds))
+		for i := range latencyBounds {
+			cumulative[i] = r.buckets[i].Load()
+		}
+		count := r.count.Load()
+		counts := make([]string, 0, len(latencyBounds)+1)
+		prev := int64(0)
+		for _, c := range cumulative {
+			// Clamped: a request completing between two of the loads above can
+			// leave a difference momentarily negative, which is not a real value.
+			counts = append(counts, strconv.FormatInt(max(c-prev, 0), 10))
+			prev = c
+		}
+		counts = append(counts, strconv.FormatInt(max(count-prev, 0), 10)) // +Inf
+		duration = append(duration, map[string]any{
+			"startTimeUnixNano": start,
+			"timeUnixNano":      now,
+			"count":             strconv.FormatInt(count, 10),
+			"sum":               float64(r.sumMS.Load()) / 1000,
+			"bucketCounts":      counts,
+			"explicitBounds":    bounds,
+			"attributes":        k.attrs(true),
+		})
+		// One point per token type, which is how gen_ai.token.type dimensions
+		// this metric. Zero is not reported: a route that recorded no tokens has
+		// not measured zero of them.
+		for _, tt := range []struct {
+			kind  string
+			total int64
+		}{{"input", r.inputTokens.Load()}, {"output", r.outputTokens.Load()}} {
+			if tt.total == 0 {
+				continue
+			}
+			attrs := append(k.attrs(false),
+				map[string]any{"key": "gen_ai.token.type", "value": map[string]any{"stringValue": tt.kind}})
+			tokens = append(tokens, map[string]any{
 				"startTimeUnixNano": start,
 				"timeUnixNano":      now,
 				"count":             strconv.FormatInt(count, 10),
-				"sum":               float64(sum),
-				"bucketCounts":      counts,
-				"explicitBounds":    bounds,
-			}},
-		},
+				"sum":               float64(tt.total),
+				"bucketCounts":      []string{"0", strconv.FormatInt(count, 10)},
+				"explicitBounds":    []any{0},
+				"attributes":        attrs,
+			})
+		}
 	}
+	out := []any{map[string]any{
+		// server, not client: this is the duration the caller waited. A request
+		// that failed over is attributed to the provider that answered while its
+		// duration includes the ones that did not -- correct for a server metric,
+		// and not what a per-provider latency reading naively suggests.
+		"name": "gen_ai.server.request.duration",
+		"unit": "s",
+		"histogram": map[string]any{
+			"aggregationTemporality": 2,
+			"dataPoints":             duration,
+		},
+	}}
+	if len(tokens) > 0 {
+		out = append(out, map[string]any{
+			"name": "gen_ai.client.token.usage",
+			"unit": "{token}",
+			"histogram": map[string]any{
+				"aggregationTemporality": 2,
+				"dataPoints":             tokens,
+			},
+		})
+	}
+	return out
+}
+
+// attrs renders the key in the conventions' vocabulary. operation and provider
+// are Required on both metrics and come from the same table the spans use, so a
+// provider cannot be named one way on a span and another on a metric.
+//
+// model is Conditionally Required "if available" -- it is omitted exactly when
+// it is not, which is a route folded past the table cap. withError adds
+// error.type, which the duration metric requires on a failure and the token
+// metric does not define.
+func (k routeKey) attrs(withError bool) []any {
+	sc := semconvOf(k.provider)
+	out := []any{
+		map[string]any{"key": "gen_ai.operation.name", "value": map[string]any{"stringValue": sc.operation}},
+		map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": sc.provider}},
+	}
+	if k.model != "" {
+		out = append(out, map[string]any{"key": "gen_ai.request.model", "value": map[string]any{"stringValue": k.model}})
+	}
+	if withError && k.errorType != "" {
+		out = append(out, map[string]any{"key": "error.type", "value": map[string]any{"stringValue": k.errorType}})
+	}
+	return out
 }
 
 // otlpHeaders applies the configured headers, reading each value from the

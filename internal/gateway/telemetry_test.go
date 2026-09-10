@@ -254,8 +254,13 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 	// latencyBounds is [5 25 100 500 1000 5000 15000 60000 90000].
 	// 10ms and 50ms straddle the 25ms bound, 300ms falls under 500, and
 	// 200000ms is past every bound.
+	// Both, as Server.chat does: the flat histogram backs /metrics in
+	// milliseconds and the keyed one backs OTLP in seconds. Driving both makes
+	// the final assertion a cross-check that the two surfaces describe the same
+	// measurement.
 	for _, ms := range []int64{10, 50, 300, 200000} {
 		m.ObserveLatency(ms)
+		m.ObserveRoute("openai", "gpt-5-nano", 200, ms, tokenUsage{})
 	}
 	tel := &Telemetry{c: Config{OTLPMetricsURL: srv.URL}, m: m, http: srv.Client(), start: time.Now()}
 	tel.exportMetrics(context.Background())
@@ -268,10 +273,10 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 					Histogram *struct {
 						AggregationTemporality int `json:"aggregationTemporality"`
 						DataPoints             []struct {
-							Count          string   `json:"count"`
-							Sum            float64  `json:"sum"`
-							BucketCounts   []string `json:"bucketCounts"`
-							ExplicitBounds []int64  `json:"explicitBounds"`
+							Count          string    `json:"count"`
+							Sum            float64   `json:"sum"`
+							BucketCounts   []string  `json:"bucketCounts"`
+							ExplicitBounds []float64 `json:"explicitBounds"`
 						} `json:"dataPoints"`
 					} `json:"histogram"`
 				} `json:"metrics"`
@@ -282,14 +287,14 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 		t.Fatalf("not valid OTLP JSON: %v", err)
 	}
 	var h *struct {
-		Count          string   `json:"count"`
-		Sum            float64  `json:"sum"`
-		BucketCounts   []string `json:"bucketCounts"`
-		ExplicitBounds []int64  `json:"explicitBounds"`
+		Count          string    `json:"count"`
+		Sum            float64   `json:"sum"`
+		BucketCounts   []string  `json:"bucketCounts"`
+		ExplicitBounds []float64 `json:"explicitBounds"`
 	}
 	var temporality int
 	for _, mt := range body.ResourceMetrics[0].ScopeMetrics[0].Metrics {
-		if mt.Name == "switchboard.request_duration_milliseconds" {
+		if mt.Name == "gen_ai.server.request.duration" {
 			if mt.Histogram == nil || len(mt.Histogram.DataPoints) != 1 {
 				t.Fatal("histogram missing or has no data point")
 			}
@@ -309,7 +314,20 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 			len(h.BucketCounts), len(h.ExplicitBounds))
 	}
 	if len(h.ExplicitBounds) != len(latencyBounds) {
-		t.Errorf("bounds = %v, want %v", h.ExplicitBounds, latencyBounds)
+		t.Errorf("bounds = %v, want %d of them", h.ExplicitBounds, len(latencyBounds))
+	}
+	// The conventions specify seconds and this gateway counts milliseconds, so
+	// every bound and the sum are divided at the OTLP boundary. A factor of a
+	// thousand is the entire risk in that function and it is invisible to any
+	// check on the metric's name, so assert the arithmetic.
+	for i, b := range latencyBounds {
+		if want := float64(b) / 1000; h.ExplicitBounds[i] != want {
+			t.Errorf("bound[%d] = %v seconds, want %v (from %dms)", i, h.ExplicitBounds[i], want, b)
+		}
+	}
+	// 10+50+300+200000 ms is 200.36 s.
+	if want := 200.36; h.Sum != want {
+		t.Errorf("sum = %v seconds, want %v", h.Sum, want)
 	}
 	// The arithmetic check that catches a cumulative-vs-per-bucket mistake even
 	// when every individual value looks reasonable.
@@ -348,8 +366,11 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 	if h.BucketCounts[len(h.BucketCounts)-1] != "1" {
 		t.Errorf("overflow bucket = %q, want 1 (200000ms)", h.BucketCounts[len(h.BucketCounts)-1])
 	}
-	if h.Sum != float64(m.LatencyMS.Load()) {
-		t.Errorf("sum = %v, want %d", h.Sum, m.LatencyMS.Load())
+	// The two surfaces, reconciled: /metrics reports milliseconds and OTLP
+	// reports seconds, and they must be the same number scaled.
+	if want := float64(m.LatencyMS.Load()) / 1000; h.Sum != want {
+		t.Errorf("OTLP sum = %v s, /metrics sum = %d ms; want %v s",
+			h.Sum, m.LatencyMS.Load(), want)
 	}
 }
 
@@ -1099,5 +1120,190 @@ func TestUsageReachesControlPlaneThroughExt(t *testing.T) {
 	json.Unmarshal(b, &core)
 	if _, ok := core["usage"]; ok {
 		t.Error("usage leaked into the core schema, which is extra=forbid")
+	}
+}
+
+// exportedMetrics decodes the OTLP metrics envelope far enough to inspect
+// histogram data points and their attributes.
+func exportedMetrics(t *testing.T, m *Metrics) map[string][]map[string]any {
+	t.Helper()
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPMetricsURL: srv.URL}, m: m, http: srv.Client(), start: time.Now()}
+	tel.exportMetrics(context.Background())
+
+	var body struct {
+		ResourceMetrics []struct {
+			ScopeMetrics []struct {
+				Metrics []struct {
+					Name      string `json:"name"`
+					Unit      string `json:"unit"`
+					Histogram *struct {
+						DataPoints []map[string]any `json:"dataPoints"`
+					} `json:"histogram"`
+				} `json:"metrics"`
+			} `json:"scopeMetrics"`
+		} `json:"resourceMetrics"`
+	}
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatalf("not valid OTLP JSON: %v", err)
+	}
+	out := map[string][]map[string]any{}
+	for _, mt := range body.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		if mt.Histogram != nil {
+			out[mt.Name+" "+mt.Unit] = mt.Histogram.DataPoints
+		}
+	}
+	return out
+}
+
+func pointAttrs(t *testing.T, p map[string]any) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	raw, ok := p["attributes"].([]any)
+	if !ok {
+		return out
+	}
+	for _, a := range raw {
+		m := a.(map[string]any)
+		out[m["key"].(string)] = m["value"].(map[string]any)["stringValue"].(string)
+	}
+	return out
+}
+
+// gen_ai.server.request.duration requires gen_ai.operation.name and
+// gen_ai.provider.name. Emitting the name without them would be a conformant
+// label over non-conformant data, which is the failure this rename exists to
+// avoid rather than commit.
+func TestDurationHistogramCarriesRequiredAttributes(t *testing.T) {
+	m := &Metrics{}
+	m.ObserveRoute("bedrock", "claude-sonnet-4", 200, 120, tokenUsage{})
+	m.ObserveRoute("gemini", "gemini-3.6-flash", 503, 90, tokenUsage{})
+
+	points := exportedMetrics(t, m)["gen_ai.server.request.duration s"]
+	if len(points) != 2 {
+		t.Fatalf("got %d data points, want 2", len(points))
+	}
+	byProvider := map[string]map[string]string{}
+	for _, p := range points {
+		a := pointAttrs(t, p)
+		byProvider[a["gen_ai.provider.name"]] = a
+	}
+	// Named through the same table the spans use, so a provider cannot be one
+	// thing on a span and another on a metric.
+	bed, ok := byProvider["aws.bedrock"]
+	if !ok {
+		t.Fatalf("no point for aws.bedrock; got %v", byProvider)
+	}
+	if bed["gen_ai.operation.name"] != "chat" || bed["gen_ai.request.model"] != "claude-sonnet-4" {
+		t.Errorf("bedrock attrs = %v", bed)
+	}
+	if _, ok := bed["error.type"]; ok {
+		t.Error("error.type set on a successful route")
+	}
+	gem, ok := byProvider["gcp.gemini"]
+	if !ok {
+		t.Fatalf("no point for gcp.gemini; got %v", byProvider)
+	}
+	if gem["gen_ai.operation.name"] != "generate_content" {
+		t.Errorf("gemini operation = %q, want generate_content", gem["gen_ai.operation.name"])
+	}
+	// Conditionally Required when the operation failed.
+	if gem["error.type"] != "503" {
+		t.Errorf("error.type = %q, want 503", gem["error.type"])
+	}
+}
+
+// gen_ai.token.type is Required on the token metric and is what splits one
+// route's counts into input and output.
+func TestTokenUsageMetricIsSplitByType(t *testing.T) {
+	m := &Metrics{}
+	m.ObserveRoute("openai", "gpt-5-nano", 200, 50, tokenUsage{Input: 30, Output: 12})
+
+	points := exportedMetrics(t, m)["gen_ai.client.token.usage {token}"]
+	if len(points) != 2 {
+		t.Fatalf("got %d data points, want one per token type", len(points))
+	}
+	sums := map[string]float64{}
+	for _, p := range points {
+		a := pointAttrs(t, p)
+		if a["gen_ai.provider.name"] != "openai" || a["gen_ai.operation.name"] != "chat" {
+			t.Errorf("point attrs = %v", a)
+		}
+		sums[a["gen_ai.token.type"]] = p["sum"].(float64)
+	}
+	if sums["input"] != 30 || sums["output"] != 12 {
+		t.Errorf("sums = %v, want input 30 output 12", sums)
+	}
+}
+
+// A route that recorded no tokens has not measured zero of them, so it must not
+// claim a zero -- the same rule the span attributes follow.
+func TestTokenUsageMetricAbsentWhenNothingCounted(t *testing.T) {
+	m := &Metrics{}
+	m.ObserveRoute("openai", "gpt-5-nano", 503, 50, tokenUsage{})
+	if points, ok := exportedMetrics(t, m)["gen_ai.client.token.usage {token}"]; ok {
+		t.Errorf("token metric exported with no tokens counted: %v", points)
+	}
+}
+
+// Models arrive from signed policies, which change over the life of a process,
+// so the key space is unbounded and an unbounded metric map is a memory leak.
+// Past the cap the model is dropped and the observation is folded onto the
+// provider: losing a dimension beats losing the measurement, and the counter
+// says the detail is missing rather than leaving a silent hole.
+func TestRouteTableFoldsPastItsCap(t *testing.T) {
+	m := &Metrics{}
+	const n = routeMaxKeys + 50
+	for i := 0; i < n; i++ {
+		m.ObserveRoute("openai", "model-"+strconv.Itoa(i), 200, 10, tokenUsage{Input: 1, Output: 1})
+	}
+	m.routes.mu.RLock()
+	keys, withModel := len(m.routes.m), 0
+	for k := range m.routes.m {
+		if k.model != "" {
+			withModel++
+		}
+	}
+	m.routes.mu.RUnlock()
+	// The cap bounds keys carrying a model. Folded keys are extra and bounded by
+	// the closed provider set, so the table settles just above the cap rather
+	// than exactly at it -- and nowhere near the 178 distinct models offered.
+	if withModel > routeMaxKeys {
+		t.Errorf("%d keys carry a model, cap is %d", withModel, routeMaxKeys)
+	}
+	if keys > routeMaxKeys+len(semconvProviders) {
+		t.Errorf("route table grew to %d keys, which is past cap plus the closed provider set", keys)
+	}
+	if m.RouteKeysFolded.Load() == 0 {
+		t.Error("folded observations were not counted")
+	}
+	// Every observation is still represented: the totals are right even though
+	// some lost their model.
+	var total int64
+	for _, p := range exportedMetrics(t, m)["gen_ai.server.request.duration s"] {
+		c, err := strconv.ParseInt(p["count"].(string), 10, 64)
+		if err != nil {
+			t.Fatalf("count %v is not an integer", p["count"])
+		}
+		total += c
+	}
+	if total != n {
+		t.Errorf("counts sum to %d, want %d; observations were dropped, not folded", total, n)
+	}
+	// The folded key carries no model, which is exactly when the conventions
+	// allow that attribute to be absent.
+	var folded int
+	for _, p := range exportedMetrics(t, m)["gen_ai.server.request.duration s"] {
+		if _, ok := pointAttrs(t, p)["gen_ai.request.model"]; !ok {
+			folded++
+		}
+	}
+	if folded != 1 {
+		t.Errorf("got %d points without a model, want exactly 1 (the folded key)", folded)
 	}
 }

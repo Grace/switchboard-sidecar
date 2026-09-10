@@ -442,7 +442,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		// the fix. event.Attempts is incremented immediately before each upstream
 		// call, so it is exactly "did this request reach a provider".
 		if event.Attempts > 0 {
-			s.Metrics.ObserveLatency(time.Since(start).Milliseconds())
+			ms := time.Since(start).Milliseconds()
+			s.Metrics.ObserveLatency(ms)
+			// The same observation, keyed by route. The flat histogram above still
+			// backs the Prometheus endpoint; this one carries the attributes the
+			// conventions require, which is what lets it be named gen_ai.*.
+			s.Metrics.ObserveRoute(event.Provider, event.Model, event.Status, ms, event.Usage)
 		}
 		if event.Status >= 400 {
 			s.Metrics.Errors.Add(1)
