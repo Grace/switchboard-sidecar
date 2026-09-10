@@ -254,12 +254,7 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 	// latencyBounds is [5 25 100 500 1000 5000 15000 60000 90000].
 	// 10ms and 50ms straddle the 25ms bound, 300ms falls under 500, and
 	// 200000ms is past every bound.
-	// Both, as Server.chat does: the flat histogram backs /metrics in
-	// milliseconds and the keyed one backs OTLP in seconds. Driving both makes
-	// the final assertion a cross-check that the two surfaces describe the same
-	// measurement.
 	for _, ms := range []int64{10, 50, 300, 200000} {
-		m.ObserveLatency(ms)
 		m.ObserveRoute("openai", "gpt-5-nano", 200, ms, tokenUsage{})
 	}
 	tel := &Telemetry{c: Config{OTLPMetricsURL: srv.URL}, m: m, http: srv.Client(), start: time.Now()}
@@ -366,12 +361,9 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 	if h.BucketCounts[len(h.BucketCounts)-1] != "1" {
 		t.Errorf("overflow bucket = %q, want 1 (200000ms)", h.BucketCounts[len(h.BucketCounts)-1])
 	}
-	// The two surfaces, reconciled: /metrics reports milliseconds and OTLP
-	// reports seconds, and they must be the same number scaled.
-	if want := float64(m.LatencyMS.Load()) / 1000; h.Sum != want {
-		t.Errorf("OTLP sum = %v s, /metrics sum = %d ms; want %v s",
-			h.Sum, m.LatencyMS.Load(), want)
-	}
+	// Both surfaces read the same keyed aggregate now, so there is nothing left
+	// to reconcile between them -- they cannot disagree by construction, which is
+	// better than the test that used to check that they had not.
 }
 
 // The runtime gauges exist to attribute the linear memory growth recorded in
@@ -1305,5 +1297,91 @@ func TestRouteTableFoldsPastItsCap(t *testing.T) {
 	}
 	if folded != 1 {
 		t.Errorf("got %d points without a model, want exactly 1 (the folded key)", folded)
+	}
+}
+
+// The first version of the token metric carried a correct sum against a single
+// bound, so it reported the right cost and a meaningless shape: p95 tokens per
+// request came back as a number that meant nothing. A sum-only assertion passes
+// against that version, so this one asserts the distribution.
+func TestTokenUsageIsADistributionNotJustASum(t *testing.T) {
+	m := &Metrics{}
+	// Four requests whose input counts straddle three bounds: 10 (<=16),
+	// 100 (<=256), 900 (<=1024), 5000 (<=16384).
+	for _, in := range []int{10, 100, 900, 5000} {
+		m.ObserveRoute("openai", "gpt-5-nano", 200, 5, tokenUsage{Input: in, Output: 1})
+	}
+	var point map[string]any
+	for _, p := range exportedMetrics(t, m)["gen_ai.client.token.usage {token}"] {
+		if pointAttrs(t, p)["gen_ai.token.type"] == "input" {
+			point = p
+		}
+	}
+	if point == nil {
+		t.Fatal("no input-token data point")
+	}
+	if got := point["sum"].(float64); got != 6010 {
+		t.Errorf("sum = %v, want 6010", got)
+	}
+	// bucketCounts are per-bucket, not cumulative, and there is one more of them
+	// than there are bounds.
+	raw := point["bucketCounts"].([]any)
+	if len(raw) != len(tokenBounds)+1 {
+		t.Fatalf("%d bucket counts for %d bounds; must differ by exactly one",
+			len(raw), len(tokenBounds))
+	}
+	counts := make([]string, len(raw))
+	for i, v := range raw {
+		counts[i] = v.(string)
+	}
+	// tokenBounds is {1, 16, 64, 256, 1024, 4096, 16384, ...}: one observation
+	// each in the 16, 256, 1024 and 16384 buckets, and none anywhere else.
+	want := map[int]string{1: "1", 3: "1", 4: "1", 6: "1"}
+	for i, c := range counts {
+		expected, ok := want[i]
+		if !ok {
+			expected = "0"
+		}
+		if c != expected {
+			t.Errorf("bucket[%d] = %s, want %s (all: %v)", i, c, expected, counts)
+		}
+	}
+}
+
+// Prometheus exposition is positional and easy to get subtly wrong, so one route
+// is asserted as an exact block rather than by substring.
+func TestPrometheusExpositionBlockIsExact(t *testing.T) {
+	m := &Metrics{}
+	m.ObserveRoute("bedrock", "claude-haiku-4-5", 503, 120, tokenUsage{})
+	w := httptest.NewRecorder()
+	m.ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
+
+	l := `gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",` +
+		`gen_ai_request_model="claude-haiku-4-5",error_type="503"`
+	want := "# TYPE gen_ai_server_request_duration_seconds histogram\n"
+	// Cumulative: zero until 120ms is reached at le="0.5", then one thereafter.
+	for _, le := range []string{"0.005", "0.025", "0.1"} {
+		want += `gen_ai_server_request_duration_seconds_bucket{` + l + `,le="` + le + `"} 0` + "\n"
+	}
+	for _, le := range []string{"0.5", "1", "5", "15", "60", "90", "+Inf"} {
+		want += `gen_ai_server_request_duration_seconds_bucket{` + l + `,le="` + le + `"} 1` + "\n"
+	}
+	want += `gen_ai_server_request_duration_seconds_sum{` + l + `} 0.12` + "\n"
+	want += `gen_ai_server_request_duration_seconds_count{` + l + `} 1` + "\n"
+
+	if body := w.Body.String(); !strings.Contains(body, want) {
+		t.Errorf("exposition block does not match.\nwant:\n%s\ngot:\n%s", want, body)
+	}
+}
+
+// Label values are escaped even though nothing can currently produce a character
+// that needs it. An unescaped value produces malformed exposition rather than a
+// wrong number, which is harder to diagnose, and the charset that makes this
+// safe today is one edit away from changing.
+func TestLabelValuesAreEscaped(t *testing.T) {
+	got := joinLabels([]string{"a", `he said "hi"`, "b", `back\slash`})
+	want := `a="he said \"hi\"",b="back\\slash"`
+	if got != want {
+		t.Errorf("joinLabels = %s, want %s", got, want)
 	}
 }

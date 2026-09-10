@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -104,7 +105,6 @@ type Metrics struct {
 	// budget" alike -- so a rising number told an operator neither which store
 	// was in trouble nor whether raising a limit would fix it.
 	CaptureFull, IdemFull atomic.Int64
-	LatencyBuckets        [len(latencyBounds)]atomic.Int64
 	LogDropped            *atomic.Int64
 	// RouteKeysFolded counts observations that arrived after the route table was
 	// full and were recorded without their model. See routeTable.
@@ -133,10 +133,48 @@ type routeLatency struct {
 	buckets [len(latencyBounds)]atomic.Int64
 	sumMS   atomic.Int64
 	count   atomic.Int64
-	// Token totals, kept on the same key so one lookup serves both metrics.
-	// Split by the conventions' gen_ai.token.type at export rather than stored
-	// twice.
-	inputTokens, outputTokens atomic.Int64
+	// Tokens are a distribution, not a total. The first version of this carried
+	// only a sum against a single-bound histogram, which reported the right cost
+	// and a meaningless shape -- a consumer asking for p95 tokens per request got
+	// a wrong answer rather than no answer, which is the failure this whole pass
+	// has been removing and does not get an exemption for being mine.
+	//
+	// Input and output are separate distributions because gen_ai.token.type
+	// makes them separate metrics, and because they are shaped differently: input
+	// tracks prompt size, output tracks how much the model chose to write.
+	tokens [2]tokenDist
+}
+
+// tokenDist is one token-type distribution for one route.
+type tokenDist struct {
+	buckets [len(tokenBounds)]atomic.Int64
+	sum     atomic.Int64
+	count   atomic.Int64
+}
+
+// Indices into routeLatency.tokens. Named rather than 0 and 1 because the export
+// reads them by name and a transposed pair would be silent.
+const (
+	tokenInput = iota
+	tokenOutput
+)
+
+// tokenBounds straddles what this gateway actually sees. ParseChat defaults
+// max_tokens to 1024 and docs/GAPS.md item 3 records reasoning models consuming
+// 1152 and 1920 against budgets of 4096 and 2048, so the interesting region is
+// hundreds to low thousands and the bounds are dense there. The top three exist
+// so a large cached prompt lands somewhere real rather than in an overflow
+// bucket that says only "big".
+var tokenBounds = [9]int64{1, 16, 64, 256, 1024, 4096, 16384, 65536, 262144}
+
+func (d *tokenDist) observe(n int64) {
+	d.sum.Add(n)
+	d.count.Add(1)
+	for i, b := range tokenBounds {
+		if n <= b {
+			d.buckets[i].Add(1)
+		}
+	}
 }
 
 // routeMaxKeys bounds the number of keys that carry a model. Models arrive from
@@ -220,6 +258,11 @@ func (m *Metrics) ObserveRoute(provider, model string, status int, ms int64, u t
 		k.errorType = strconv.Itoa(status)
 	}
 	r := m.routes.get(k, &m.RouteKeysFolded)
+	// Completed and LatencyMS are not exported; they are the cheap global totals
+	// that outlived the flat histogram they used to back, and server_test reads
+	// Completed as "did this request reach a provider and finish".
+	m.Completed.Add(1)
+	m.LatencyMS.Add(ms)
 	r.sumMS.Add(ms)
 	r.count.Add(1)
 	for i, b := range latencyBounds {
@@ -227,30 +270,26 @@ func (m *Metrics) ObserveRoute(provider, model string, status int, ms int64, u t
 			r.buckets[i].Add(1)
 		}
 	}
-	r.inputTokens.Add(int64(u.Input))
-	r.outputTokens.Add(int64(u.Output))
+	// Only when the provider reported usage at all. A request that reached a
+	// provider and got no usage back has not measured zero tokens, and feeding a
+	// zero into the distribution would move every percentile toward it.
+	if u.Input != 0 || u.Output != 0 {
+		r.tokens[tokenInput].observe(int64(u.Input))
+		r.tokens[tokenOutput].observe(int64(u.Output))
+	}
 }
 
 // The first bucket of an explicit-bounds histogram has no lower bound, so
 // whatever sits below latencyBounds[0] is unmeasurable: a percentile drawn from
 // that bucket extrapolates below zero and Honeycomb duly reports a negative
-// duration. ObserveLatency runs from a defer in Server.chat on every request,
-// not only on inference, so 5 and 25 are not padding. Auth rejections, policy
-// errors, refused requests and idempotent replays all finish in single-digit
-// milliseconds, and with a floor of 100 they were indistinguishable from each
-// other and from a fast completion. Everything from 100 up is unchanged, so a
-// query written against le="100" or above still means what it did.
+// duration. The floor was 100ms and every request landed under it; 5 and 25 are
+// not padding. Everything from 100 up is unchanged, so a query written against
+// le="100" or above still means what it did.
+//
+// Requests that never reached a provider are no longer in this population at
+// all -- Server.chat gates the observation on Attempts > 0 -- which was the
+// other half of the same problem.
 var latencyBounds = [9]int64{5, 25, 100, 500, 1000, 5000, 15000, 60000, 90000}
-
-func (m *Metrics) ObserveLatency(ms int64) {
-	m.LatencyMS.Add(ms)
-	m.Completed.Add(1)
-	for i, b := range latencyBounds {
-		if ms <= b {
-			m.LatencyBuckets[i].Add(1)
-		}
-	}
-}
 
 // series is one exported metric. Counters and gauges are listed once, here, so
 // the Prometheus endpoint and the OTLP exporter cannot drift apart: a counter
@@ -330,12 +369,135 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	for _, v := range m.series() {
 		fmt.Fprintf(w, "# TYPE switchboard_%s %s\nswitchboard_%s %d\n", v.name, v.kind, v.name, v.v.Load())
 	}
-	fmt.Fprintln(w, "# TYPE switchboard_request_duration_milliseconds histogram")
-	for i, b := range latencyBounds {
-		fmt.Fprintf(w, "switchboard_request_duration_milliseconds_bucket{le=\"%d\"} %d\n", b, m.LatencyBuckets[i].Load())
-	}
-	fmt.Fprintf(w, "switchboard_request_duration_milliseconds_bucket{le=\"+Inf\"} %d\nswitchboard_request_duration_milliseconds_sum %d\nswitchboard_request_duration_milliseconds_count %d\n", m.Completed.Load(), m.LatencyMS.Load(), m.Completed.Load())
+	m.writeHistograms(w)
 }
+
+// writeHistograms renders the two GenAI histograms in Prometheus exposition
+// format, from the same keyed data the OTLP exporter reads.
+//
+// The names are derivations, not inventions: OpenTelemetry's Prometheus mapping
+// replaces dots with underscores, converts the UCUM unit to a word and appends
+// it, and drops bracketed units -- so gen_ai.server.request.duration in seconds
+// becomes gen_ai_server_request_duration_seconds, and gen_ai.client.token.usage
+// in {token} becomes gen_ai_client_token_usage. Attributes MUST become labels.
+// The switchboard_* counters above keep their name because they describe
+// routing, which no convention covers.
+//
+// Prometheus buckets are CUMULATIVE, which is what we already store, so this
+// path uses the values raw where the OTLP path differences them. That is the
+// inverse of the mistake differenced() exists to prevent, and getting it
+// backwards here would produce a histogram wrong everywhere but the first
+// bucket.
+func (m *Metrics) writeHistograms(w io.Writer) {
+	routes := m.routes.snapshot()
+	if len(routes) == 0 {
+		return
+	}
+	// Sorted so the exposition is stable across scrapes. Map order is not, and
+	// an endpoint whose output reorders on every request is unreadable in a diff
+	// and awkward to test.
+	keys := make([]routeKey, 0, len(routes))
+	for k := range routes {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if a.provider != b.provider {
+			return a.provider < b.provider
+		}
+		if a.model != b.model {
+			return a.model < b.model
+		}
+		return a.errorType < b.errorType
+	})
+
+	fmt.Fprintln(w, "# TYPE gen_ai_server_request_duration_seconds histogram")
+	for _, k := range keys {
+		r := routes[k]
+		l := k.labels(true)
+		for i, b := range latencyBounds {
+			fmt.Fprintf(w, "gen_ai_server_request_duration_seconds_bucket{%s} %d\n",
+				joinLabels(l, "le", strconv.FormatFloat(float64(b)/1000, 'f', -1, 64)),
+				r.buckets[i].Load())
+		}
+		n := r.count.Load()
+		fmt.Fprintf(w, "gen_ai_server_request_duration_seconds_bucket{%s} %d\n",
+			joinLabels(l, "le", "+Inf"), n)
+		// _sum and _count carry the same labels as _bucket. Omitting them is the
+		// classic error in a hand-rolled exposition and makes the series
+		// unjoinable with its own buckets.
+		fmt.Fprintf(w, "gen_ai_server_request_duration_seconds_sum{%s} %s\n",
+			joinLabels(l), strconv.FormatFloat(float64(r.sumMS.Load())/1000, 'f', -1, 64))
+		fmt.Fprintf(w, "gen_ai_server_request_duration_seconds_count{%s} %d\n", joinLabels(l), n)
+	}
+
+	var wrote bool
+	for _, k := range keys {
+		for i, kind := range []string{"input", "output"} {
+			d := &routes[k].tokens[i]
+			n := d.count.Load()
+			if n == 0 {
+				continue
+			}
+			if !wrote {
+				fmt.Fprintln(w, "# TYPE gen_ai_client_token_usage histogram")
+				wrote = true
+			}
+			// error.type is not defined on the token metric, so the label set is
+			// the duration one without it, plus the token type.
+			l := append(k.labels(false), "gen_ai_token_type", kind)
+			for j, b := range tokenBounds {
+				fmt.Fprintf(w, "gen_ai_client_token_usage_bucket{%s} %d\n",
+					joinLabels(l, "le", strconv.FormatInt(b, 10)), d.buckets[j].Load())
+			}
+			fmt.Fprintf(w, "gen_ai_client_token_usage_bucket{%s} %d\n", joinLabels(l, "le", "+Inf"), n)
+			fmt.Fprintf(w, "gen_ai_client_token_usage_sum{%s} %d\n", joinLabels(l), d.sum.Load())
+			fmt.Fprintf(w, "gen_ai_client_token_usage_count{%s} %d\n", joinLabels(l), n)
+		}
+	}
+}
+
+// labels returns the key as flat name/value pairs, in the conventions'
+// vocabulary with dots replaced -- the same mapping rule that produces the
+// metric names. Ordered, because the exposition must be stable.
+func (k routeKey) labels(withError bool) []string {
+	sc := semconvOf(k.provider)
+	out := []string{
+		"gen_ai_operation_name", sc.operation,
+		"gen_ai_provider_name", sc.provider,
+	}
+	if k.model != "" {
+		out = append(out, "gen_ai_request_model", k.model)
+	}
+	if withError && k.errorType != "" {
+		out = append(out, "error_type", k.errorType)
+	}
+	return out
+}
+
+// joinLabels renders name/value pairs as a Prometheus label set, appending any
+// extra pair given. Values are escaped even though nothing can currently produce
+// a character needing it -- provider is a closed set, error.type is a status
+// code, and policy.go constrains a model to a charset with no quote, backslash
+// or newline in it. That constraint is one edit away from changing, and an
+// unescaped value would produce malformed exposition rather than a wrong number,
+// which is worse to diagnose.
+func joinLabels(pairs []string, extra ...string) string {
+	var b strings.Builder
+	all := append(append([]string{}, pairs...), extra...)
+	for i := 0; i < len(all); i += 2 {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(all[i])
+		b.WriteString(`="`)
+		b.WriteString(labelEscaper.Replace(all[i+1]))
+		b.WriteString(`"`)
+	}
+	return b.String()
+}
+
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
 
 type Event struct {
 	ID        string `json:"id"`
@@ -850,30 +1012,12 @@ func (t *Telemetry) routeHistograms(now, start string) []any {
 	if len(routes) == 0 {
 		return nil
 	}
-	bounds := make([]any, 0, len(latencyBounds))
-	for _, b := range latencyBounds {
-		bounds = append(bounds, float64(b)/1000)
-	}
+	bounds := secondsBounds()
 	duration := make([]any, 0, len(routes))
 	tokens := make([]any, 0, 2*len(routes))
 	for k, r := range routes {
-		// Read each counter once. They are individually atomic but not a
-		// consistent snapshot, so differencing re-read values could produce
-		// nonsense.
-		cumulative := make([]int64, len(latencyBounds))
-		for i := range latencyBounds {
-			cumulative[i] = r.buckets[i].Load()
-		}
 		count := r.count.Load()
-		counts := make([]string, 0, len(latencyBounds)+1)
-		prev := int64(0)
-		for _, c := range cumulative {
-			// Clamped: a request completing between two of the loads above can
-			// leave a difference momentarily negative, which is not a real value.
-			counts = append(counts, strconv.FormatInt(max(c-prev, 0), 10))
-			prev = c
-		}
-		counts = append(counts, strconv.FormatInt(max(count-prev, 0), 10)) // +Inf
+		counts := differenced(r.buckets[:], count)
 		duration = append(duration, map[string]any{
 			"startTimeUnixNano": start,
 			"timeUnixNano":      now,
@@ -884,24 +1028,23 @@ func (t *Telemetry) routeHistograms(now, start string) []any {
 			"attributes":        k.attrs(true),
 		})
 		// One point per token type, which is how gen_ai.token.type dimensions
-		// this metric. Zero is not reported: a route that recorded no tokens has
-		// not measured zero of them.
-		for _, tt := range []struct {
-			kind  string
-			total int64
-		}{{"input", r.inputTokens.Load()}, {"output", r.outputTokens.Load()}} {
-			if tt.total == 0 {
+		// this metric. A route that recorded no tokens reports none: it has not
+		// measured zero of them.
+		for i, kind := range []string{"input", "output"} {
+			d := &r.tokens[i]
+			n := d.count.Load()
+			if n == 0 {
 				continue
 			}
 			attrs := append(k.attrs(false),
-				map[string]any{"key": "gen_ai.token.type", "value": map[string]any{"stringValue": tt.kind}})
+				map[string]any{"key": "gen_ai.token.type", "value": map[string]any{"stringValue": kind}})
 			tokens = append(tokens, map[string]any{
 				"startTimeUnixNano": start,
 				"timeUnixNano":      now,
-				"count":             strconv.FormatInt(count, 10),
-				"sum":               float64(tt.total),
-				"bucketCounts":      []string{"0", strconv.FormatInt(count, 10)},
-				"explicitBounds":    []any{0},
+				"count":             strconv.FormatInt(n, 10),
+				"sum":               float64(d.sum.Load()),
+				"bucketCounts":      differenced(d.buckets[:], n),
+				"explicitBounds":    boundsOf(tokenBounds[:]),
 				"attributes":        attrs,
 			})
 		}
@@ -927,6 +1070,53 @@ func (t *Telemetry) routeHistograms(now, start string) []any {
 				"dataPoints":             tokens,
 			},
 		})
+	}
+	return out
+}
+
+// differenced converts our cumulative buckets into the per-bucket counts OTLP
+// wants, plus the overflow bucket.
+//
+// This is the conversion that is easy to get silently wrong, and it runs in both
+// directions in this file: OTLP wants the difference, Prometheus wants the
+// cumulative values we already hold. Emitting cumulative values as if they were
+// differenced produces a plausible-looking histogram that is wrong everywhere
+// except the first bucket.
+//
+// len(result) is len(bounds)+1, which consumers require.
+func differenced(cumulative []atomic.Int64, count int64) []string {
+	// Read each counter once. They are individually atomic but not a consistent
+	// snapshot, so differencing re-read values could produce nonsense.
+	seen := make([]int64, len(cumulative))
+	for i := range cumulative {
+		seen[i] = cumulative[i].Load()
+	}
+	out := make([]string, 0, len(seen)+1)
+	prev := int64(0)
+	for _, c := range seen {
+		// Clamped: an observation landing between two of the loads above can
+		// leave a difference momentarily negative, which is not a real value.
+		out = append(out, strconv.FormatInt(max(c-prev, 0), 10))
+		prev = c
+	}
+	return append(out, strconv.FormatInt(max(count-prev, 0), 10))
+}
+
+// secondsBounds renders latencyBounds in the unit the conventions specify.
+// Durations are stored in milliseconds and this division is the only place they
+// become seconds.
+func secondsBounds() []any {
+	out := make([]any, 0, len(latencyBounds))
+	for _, b := range latencyBounds {
+		out = append(out, float64(b)/1000)
+	}
+	return out
+}
+
+func boundsOf(bounds []int64) []any {
+	out := make([]any, 0, len(bounds))
+	for _, b := range bounds {
+		out = append(out, b)
 	}
 	return out
 }

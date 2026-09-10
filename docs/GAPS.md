@@ -316,11 +316,45 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     and `switchboard.policy_version` stay where they are. `gen-ai-spans.md`,
     `gen-ai-agent-spans.md` and `gen-ai-metrics.md` were read directly: there is
     still no gateway, router, failover or retry convention, so item 18's
-    reasoning holds. The loopback `/metrics` endpoint also keeps its milliseconds
-    and its name; OTel semconv governs the OTLP surface, Prometheus exposition
-    has its own rules, and nothing scrapes that endpoint in a shipped
-    deployment. The cost of that choice is that one measurement now has two
-    names and two units depending on which surface you read.
+    reasoning holds.
+
+    **`/metrics` was left in milliseconds for a day, on a reason that was
+    wrong.** The argument was that OTel semconv governs OTLP, Prometheus
+    exposition has its own rules, nothing scrapes that endpoint in a shipped
+    deployment, and renaming it would break the tables in `docs/DEPLOYMENT.md`.
+    That last clause is simply false: no document anywhere names a Prometheus
+    metric, and those tables use the dotted OTLP names. The rest was true and
+    not sufficient. One measurement carried two names, two units and two
+    dimensionalities across two surfaces of the same product, which is the kind
+    of inconsistency a customer reads as carelessness.
+
+    Both surfaces now render the same keyed data. The Prometheus names are
+    derivations rather than inventions: OpenTelemetry's Prometheus mapping
+    replaces dots with underscores, converts the UCUM unit to a word and appends
+    it, and drops bracketed units, giving
+    `gen_ai_server_request_duration_seconds` and `gen_ai_client_token_usage`.
+    Attributes become labels by the same rule. The `switchboard_*` counters keep
+    their names, because nothing above covers routing.
+
+    Aligning **removed** code rather than adding it. `LatencyBuckets` and
+    `ObserveLatency` existed only to feed the Prometheus histogram, so the whole
+    parallel path is gone and `Server.chat` makes one observation instead of
+    two. The test that checked the two surfaces agreed went with it: they now
+    cannot disagree, which is better than verifying that they had not.
+
+    One trap runs in both directions and is worth naming. Prometheus buckets are
+    cumulative, which is what is stored; OTLP wants them differenced. Using
+    either form where the other belongs produces a histogram that looks
+    plausible and is wrong everywhere except the first bucket, so the conversion
+    lives in one function and both directions are asserted.
+
+    **A defect of my own, found and fixed in the same pass.** The first version
+    of `gen_ai.client.token.usage` was a degenerate histogram: a single bound
+    with a correct sum and a meaningless shape. Cost queries would have been
+    right and any percentile of tokens per request would have been wrong rather
+    than absent, which is exactly the silent wrongness this item began by
+    describing. It now has real bounds spanning the budgets `ParseChat` defaults
+    to and the reasoning overruns item 3 records, observed per request.
 
 ## Still open
 

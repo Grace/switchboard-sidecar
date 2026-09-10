@@ -64,13 +64,36 @@ func TestCancelledRequestNotReplayed(t *testing.T) {
 		t.Fatal("cancellation penalized provider")
 	}
 }
+
+// The Prometheus surface renders the same keyed data as OTLP, under the names
+// OpenTelemetry's Prometheus mapping derives: dots to underscores, the UCUM unit
+// converted to a word and appended. Buckets here are cumulative, which is what
+// we store and the opposite of what OTLP wants.
 func TestMetricsHistogram(t *testing.T) {
 	m := &Metrics{}
-	m.ObserveLatency(300)
-	m.ObserveLatency(800)
+	m.ObserveRoute("openai", "gpt-5-nano", 200, 300, tokenUsage{})
+	m.ObserveRoute("openai", "gpt-5-nano", 200, 800, tokenUsage{})
 	w := httptest.NewRecorder()
 	m.ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
-	if !strings.Contains(w.Body.String(), `switchboard_request_duration_milliseconds_bucket{le="500"} 1`) || !strings.Contains(w.Body.String(), "switchboard_request_duration_milliseconds_count 2") {
-		t.Fatal(w.Body.String())
+	body := w.Body.String()
+	l := `{gen_ai_operation_name="chat",gen_ai_provider_name="openai",gen_ai_request_model="gpt-5-nano"`
+	for _, want := range []string{
+		"# TYPE gen_ai_server_request_duration_seconds histogram",
+		// 300ms is at or below 0.5s and 800ms is not: cumulative, so one here.
+		`gen_ai_server_request_duration_seconds_bucket` + l + `,le="0.5"} 1`,
+		// Both are at or below 1s.
+		`gen_ai_server_request_duration_seconds_bucket` + l + `,le="1"} 2`,
+		`gen_ai_server_request_duration_seconds_bucket` + l + `,le="+Inf"} 2`,
+		// Seconds, and carrying the same labels as the buckets.
+		`gen_ai_server_request_duration_seconds_sum` + l + `} 1.1`,
+		`gen_ai_server_request_duration_seconds_count` + l + `} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in:\n%s", want, body)
+		}
+	}
+	// No usage was reported, so the token metric must not appear at all.
+	if strings.Contains(body, "gen_ai_client_token_usage") {
+		t.Errorf("token metric emitted with no tokens counted:\n%s", body)
 	}
 }
