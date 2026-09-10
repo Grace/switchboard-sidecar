@@ -210,11 +210,36 @@ type normalized struct {
 	// empty completion: as it approaches the caller's budget, the answer runs
 	// out of room before it is written.
 	Reasoning int
+	// CacheRead and CacheWrite are the parts of Input that were served from, or
+	// written to, a provider-managed prompt cache. They are already inside Input
+	// -- the sum is what the request actually cost and is the billing figure --
+	// and they are kept apart from it because they cost different amounts and
+	// because the conventions name them separately
+	// (gen_ai.usage.cache_read.input_tokens / cache_write.input_tokens).
+	//
+	// Summing without keeping the parts was an unforced loss: a cached prompt
+	// and a cold one bill very differently, and a total alone cannot tell them
+	// apart, so nothing could answer whether caching was working.
+	CacheRead, CacheWrite int
 	// UsageMismatch reports that the provider's own token totals did not add up,
 	// which means this gateway's billing figure may be wrong. It is surfaced as a
 	// metric rather than an error: the request itself is fine, but a provider
 	// changing how it accounts for tokens must not silently drift revenue.
 	UsageMismatch bool
+}
+
+// usageOf lifts the token counts out of a normalized response and into the
+// shape telemetry exports. Deliberately a function beside the struct it reads
+// rather than a method on the other side: a count added above has to be carried
+// here, and the two field lists sitting together is what makes that obvious.
+func usageOf(n normalized) tokenUsage {
+	return tokenUsage{
+		Input:      n.Input,
+		Output:     n.Output,
+		Reasoning:  n.Reasoning,
+		CacheRead:  n.CacheRead,
+		CacheWrite: n.CacheWrite,
+	}
 }
 
 func finish(s string) (string, error) {
@@ -378,6 +403,10 @@ func normalize(provider string, b []byte, stream bool) (normalized, bool, error)
 		// decode to zero, so an uncached response is unchanged.
 		n.Input = w.Usage.Input + w.Usage.CacheCreation + w.Usage.CacheRead
 		n.Output = w.Usage.Output
+		// The parts as well as the sum. Anthropic is the only one of the four
+		// that reports a cache split today, so these stay zero elsewhere, which
+		// is the correct value rather than a missing one.
+		n.CacheRead, n.CacheWrite = w.Usage.CacheRead, w.Usage.CacheCreation
 		if stream {
 			switch w.Type {
 			case "content_block_start":

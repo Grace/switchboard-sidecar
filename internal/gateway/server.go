@@ -806,6 +806,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			event.Status = 200
+			// Outside the branch below for the same reason as the non-streaming
+			// path: a stream that broke partway was still billed for what it
+			// produced, and that is exactly the request someone asks about.
+			event.Usage = streamed.usage
 			s.circuits[route.Provider].result(err != nil)
 			if err != nil {
 				event.Status = 502
@@ -840,6 +844,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		if n.UsageMismatch {
 			s.Metrics.UsageMismatch.Add(1)
 		}
+		// Recorded before the error check below, and before any failover, so the
+		// span for a request that was answered and then rejected as unusable
+		// still says what that answer cost. It was still billed.
+		event.Usage = usageOf(n)
 		s.circuits[route.Provider].result(e != nil)
 		if e != nil {
 			idemSettled = s.settleUnknown(idemKey, hashBody(b))
@@ -947,6 +955,9 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 		if n.UsageMismatch && !mismatchCounted {
 			s.Metrics.UsageMismatch.Add(1)
 			mismatchCounted = true
+		}
+		if u := usageOf(n); u.Input != 0 || u.Output != 0 {
+			out.usage = u
 		}
 		if finished && n.Text != "" {
 			return errors.New("text after finish")
@@ -1290,6 +1301,11 @@ func Healthcheck(addr string) int {
 type streamResult struct {
 	text   string
 	finish string
+	// usage arrives in a late frame of the stream rather than alongside the
+	// text: providers report totals once, at or near the end. Each frame that
+	// carries any is taken as the running truth, so the last one wins and a
+	// stream cut short still reports whatever had been stated by then.
+	usage tokenUsage
 }
 
 // settleUnknown marks a key ambiguous. Deliberately sticky: releasing it would

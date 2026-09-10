@@ -179,9 +179,10 @@ func TestOpenAIRequestUsesMaxCompletionTokens(t *testing.T) {
 // tells the caller their request cost 50 input tokens when it cost 100,050.
 func TestAnthropicCountsCachedInputTokens(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		usage string
-		want  int
+		name                  string
+		usage                 string
+		want                  int
+		wantRead, wantWritten int
 	}{
 		{
 			// The case every request has today. cache_control is opt-in, so both
@@ -192,28 +193,33 @@ func TestAnthropicCountsCachedInputTokens(t *testing.T) {
 			want:  11,
 		},
 		{
-			name:  "cache being written",
-			usage: `{"input_tokens":50,"cache_creation_input_tokens":1024,"output_tokens":7}`,
-			want:  1074,
+			name:        "cache being written",
+			usage:       `{"input_tokens":50,"cache_creation_input_tokens":1024,"output_tokens":7}`,
+			want:        1074,
+			wantWritten: 1024,
 		},
 		{
-			name:  "cache being read",
-			usage: `{"input_tokens":50,"cache_read_input_tokens":100000,"output_tokens":7}`,
-			want:  100050, // Anthropic's own worked example.
+			name:     "cache being read",
+			usage:    `{"input_tokens":50,"cache_read_input_tokens":100000,"output_tokens":7}`,
+			want:     100050, // Anthropic's own worked example.
+			wantRead: 100000,
 		},
 		{
 			name: "reading one cache while writing another",
 			usage: `{"input_tokens":50,"cache_creation_input_tokens":1024,` +
 				`"cache_read_input_tokens":100000,"output_tokens":7}`,
-			want: 101074,
+			want:        101074,
+			wantRead:    100000,
+			wantWritten: 1024,
 		},
 		{
 			// The whole prompt was cached and nothing followed the breakpoint.
 			// input_tokens is legitimately zero here, and reporting zero input for
 			// a request that processed 4096 tokens is the starkest form of the bug.
-			name:  "everything cached, nothing after the breakpoint",
-			usage: `{"input_tokens":0,"cache_read_input_tokens":4096,"output_tokens":7}`,
-			want:  4096,
+			name:     "everything cached, nothing after the breakpoint",
+			usage:    `{"input_tokens":0,"cache_read_input_tokens":4096,"output_tokens":7}`,
+			want:     4096,
+			wantRead: 4096,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -229,6 +235,20 @@ func TestAnthropicCountsCachedInputTokens(t *testing.T) {
 			if n.Output != 7 {
 				t.Errorf("Output = %d, want 7; counting cached input must not disturb output",
 					n.Output)
+			}
+			// The sum is the billing figure and the parts are what say whether
+			// caching is working. Summing without keeping the parts made a warm
+			// prompt and a cold one indistinguishable at every layer above this.
+			if n.CacheRead != tc.wantRead {
+				t.Errorf("CacheRead = %d, want %d", n.CacheRead, tc.wantRead)
+			}
+			if n.CacheWrite != tc.wantWritten {
+				t.Errorf("CacheWrite = %d, want %d", n.CacheWrite, tc.wantWritten)
+			}
+			// The parts are inside the total, not additions to it.
+			if n.CacheRead+n.CacheWrite > n.Input {
+				t.Errorf("parts (%d+%d) exceed the total %d",
+					n.CacheRead, n.CacheWrite, n.Input)
 			}
 		})
 	}

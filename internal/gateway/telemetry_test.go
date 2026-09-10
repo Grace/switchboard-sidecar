@@ -780,7 +780,7 @@ func TestSpanCarriesRoutingDecision(t *testing.T) {
 	})
 	attrs, _ := spanAttrs(t, got)
 	for k, want := range map[string]string{
-		"gen_ai.provider.name": "bedrock",
+		"gen_ai.provider.name": "aws.bedrock",
 		"gen_ai.request.model": "claude-sonnet-4",
 		"switchboard.attempts": "3",
 		"switchboard.fault":    "account",
@@ -788,6 +788,72 @@ func TestSpanCarriesRoutingDecision(t *testing.T) {
 		if attrs[k] != want {
 			t.Errorf("%s = %q, want %q", k, attrs[k], want)
 		}
+	}
+}
+
+// gen_ai.provider.name is a closed enum, and an off-enum value fails silently:
+// nothing rejects it, the span still exports, and the traffic simply stops
+// grouping with everything else that provider serves. Two of our four were
+// wrong that way for as long as spans have existed.
+//
+// Asserted per provider rather than by round-tripping the same table the code
+// reads, which would pass no matter what the table said. These four strings are
+// copied from the registry by hand on purpose; that is the whole test.
+func TestProviderNamesMatchSemconvEnum(t *testing.T) {
+	for _, c := range []struct{ provider, wantProvider, wantOperation string }{
+		{"openai", "openai", "chat"},
+		{"anthropic", "anthropic", "chat"},
+		// generativelanguage.googleapis.com, per the registry footnote scoping
+		// gcp.gemini to that endpoint; gcp.vertex_ai is aiplatform.googleapis.com,
+		// which is not the API adapter.go calls.
+		{"gemini", "gcp.gemini", "generate_content"},
+		// Converse is a chat API, so the operation is chat and not a bedrock-
+		// specific value -- aws-bedrock.md defines no override.
+		{"bedrock", "aws.bedrock", "chat"},
+	} {
+		t.Run(c.provider, func(t *testing.T) {
+			var got []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got, _ = io.ReadAll(r.Body)
+				w.Write([]byte(`{}`))
+			}))
+			defer srv.Close()
+			tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+			tel.exportOTLP(context.Background(), Event{
+				ID: "a", TraceID: "t", SpanID: "s", Provider: c.provider,
+				Model: "m", Status: 200, Start: 1, End: 2,
+			})
+			attrs, span := spanAttrs(t, got)
+			if attrs["gen_ai.provider.name"] != c.wantProvider {
+				t.Errorf("gen_ai.provider.name = %q, want %q", attrs["gen_ai.provider.name"], c.wantProvider)
+			}
+			if attrs["gen_ai.operation.name"] != c.wantOperation {
+				t.Errorf("gen_ai.operation.name = %q, want %q", attrs["gen_ai.operation.name"], c.wantOperation)
+			}
+			// "{gen_ai.operation.name} {gen_ai.request.model}".
+			if want := c.wantOperation + " m"; span["name"] != want {
+				t.Errorf("span name = %q, want %q", span["name"], want)
+			}
+		})
+	}
+}
+
+// A request refused before any route was chosen carries no model, and the span
+// name is the operation alone rather than one with a trailing space.
+func TestSpanNameWithoutModel(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+	tel.exportOTLP(context.Background(), Event{
+		ID: "a", TraceID: "t", SpanID: "s", Provider: "openai",
+		Status: 403, Start: 1, End: 2,
+	})
+	if _, span := spanAttrs(t, got); span["name"] != "chat" {
+		t.Errorf("span name = %q, want %q", span["name"], "chat")
 	}
 }
 
@@ -924,5 +990,114 @@ func TestSingleSpanExportStillWorks(t *testing.T) {
 	attrs, _ := spanAttrs(t, got)
 	if attrs["error.type"] != "503" || attrs["gen_ai.provider.name"] != "openai" {
 		t.Errorf("single-span export lost attributes: %v", attrs)
+	}
+}
+
+// adapter.go has always normalised four incompatible usage shapes into one set
+// of counts, and then used them for a single integrity check and dropped them.
+// Nothing downstream could say what a request cost, which is the first question
+// anyone puts to a gateway.
+func TestSpanCarriesTokenUsage(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+	tel.exportOTLP(context.Background(), Event{
+		ID: "a", TraceID: "t", SpanID: "s", Provider: "anthropic", Model: "claude-haiku-4-5",
+		Status: 200, Start: 1, End: 2,
+		// Anthropic's worked example: a 50-token message against a 100,000-token
+		// warm cache. Input is the total; the parts are inside it.
+		Usage: tokenUsage{Input: 100050, Output: 7, CacheRead: 100000},
+	})
+	attrs, _ := spanAttrs(t, got)
+	for k, want := range map[string]string{
+		"gen_ai.usage.input_tokens":            "100050",
+		"gen_ai.usage.output_tokens":           "7",
+		"gen_ai.usage.cache_read.input_tokens": "100000",
+	} {
+		if attrs[k] != want {
+			t.Errorf("%s = %q, want %q", k, attrs[k], want)
+		}
+	}
+	// Not measured is not the same as measured zero, and this provider wrote no
+	// cache and did no reasoning on this call.
+	for _, k := range []string{
+		"gen_ai.usage.cache_write.input_tokens",
+		"gen_ai.usage.reasoning.output_tokens",
+	} {
+		if _, ok := attrs[k]; ok {
+			t.Errorf("%s was emitted for a call that did not measure it", k)
+		}
+	}
+}
+
+// A request that never reached a provider has no usage to report, and a span
+// claiming it cost zero tokens is a false measurement rather than a missing one.
+func TestSpanOmitsUsageWhenNoProviderAnswered(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+	tel.exportOTLP(context.Background(), Event{
+		ID: "a", TraceID: "t", SpanID: "s", Provider: "openai",
+		Status: 403, Start: 1, End: 2,
+	})
+	attrs, _ := spanAttrs(t, got)
+	for k := range attrs {
+		if strings.HasPrefix(k, "gen_ai.usage.") {
+			t.Errorf("%s emitted for a request that reached no provider", k)
+		}
+	}
+}
+
+// An output of zero IS a measurement: a reasoning model can spend its whole
+// budget on hidden reasoning and write nothing, billed in full. That is the case
+// this gateway exists to notice, so it must not be suppressed as "empty".
+func TestZeroOutputTokensIsReportedNotSuppressed(t *testing.T) {
+	u := tokenUsage{Input: 1024, Output: 0, Reasoning: 1024}
+	got := map[string]int{}
+	for _, a := range u.attrs() {
+		got[a.key] = a.value
+	}
+	if v, ok := got["gen_ai.usage.output_tokens"]; !ok || v != 0 {
+		t.Errorf("output_tokens = %v (present=%v), want 0 present", v, ok)
+	}
+	if got["gen_ai.usage.reasoning.output_tokens"] != 1024 {
+		t.Errorf("reasoning = %d, want 1024", got["gen_ai.usage.reasoning.output_tokens"])
+	}
+}
+
+// The control plane forbids unknown keys on the core event model, so usage
+// travels in ext -- the same route model and fault take. A gateway newer than
+// its control plane then degrades instead of having every event rejected.
+func TestUsageReachesControlPlaneThroughExt(t *testing.T) {
+	e := Event{ID: "a", Provider: "openai", Model: "gpt-5-nano",
+		Usage: tokenUsage{Input: 11, Output: 7, Reasoning: 4}}.wire()
+	for k, want := range map[string]any{
+		"gen_ai.usage.input_tokens":            11,
+		"gen_ai.usage.output_tokens":           7,
+		"gen_ai.usage.reasoning.output_tokens": 4,
+		"model":                                "gpt-5-nano",
+	} {
+		if e.Ext[k] != want {
+			t.Errorf("ext[%q] = %v, want %v", k, e.Ext[k], want)
+		}
+	}
+	// The core is unchanged: anything the control plane validates strictly must
+	// still be exactly what it was.
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var core map[string]any
+	json.Unmarshal(b, &core)
+	if _, ok := core["usage"]; ok {
+		t.Error("usage leaked into the core schema, which is extra=forbid")
 	}
 }

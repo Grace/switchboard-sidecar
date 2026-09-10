@@ -247,6 +247,16 @@ type Event struct {
 	// decision nothing type-checks.
 	Model string `json:"-"`
 	Fault string `json:"-"`
+	// Usage is what the provider said the request cost. adapter.go already
+	// normalises four incompatible usage shapes into these five numbers and,
+	// until now, used them only to decide whether a provider's own totals added
+	// up -- then dropped them. Nothing downstream could answer what a request
+	// cost, which is the first question anyone puts to a gateway.
+	//
+	// Span-only in the same sense as Model and Fault: it reaches the control
+	// plane through Ext, so an older control plane treats it as data rather than
+	// failing the whole event.
+	Usage tokenUsage `json:"-"`
 	// Ext carries everything the core schema does not name. The control plane
 	// validates the core strictly and keeps this verbatim, so a field added to
 	// the gateway reaches an older control plane as data rather than as a
@@ -271,6 +281,9 @@ func (e Event) wire() Event {
 	}
 	if e.Fault != "" {
 		ext["fault"] = e.Fault
+	}
+	for _, a := range e.Usage.attrs() {
+		ext[a.key] = a.value
 	}
 	if len(ext) == 0 {
 		return e
@@ -804,9 +817,99 @@ func (t *Telemetry) exportOTLPBatch(ctx context.Context, events []Event) {
 // batching above shares the encoding rather than duplicating it -- the span
 // attributes here are the product of several corrections and must not exist in
 // two places.
+// semconv describes one provider in the GenAI semantic conventions' vocabulary,
+// which is not ours and cannot be made ours.
+//
+// Our four identifiers are a wire contract: controlplane/app.py validates them
+// as a Literal, every signed policy carries them, and policy.go:136 enforces
+// them. Renaming them to match the convention would break stored policies and
+// every gateway older than the control plane. So the translation lives here, at
+// the single boundary where the convention applies -- which is exactly the job
+// an external normalizer would be doing, done by the emitter that already knows
+// the answer.
+//
+// Two of the four already conform. The other two did not, silently: nothing
+// rejects an off-enum value, so bedrock and gemini traffic simply sat outside
+// every GenAI-aware backend's provider grouping, and gen_ai.provider.name is
+// the documented discriminator the rest of the span is read through.
+//
+// operation is per provider rather than a constant because the convention says
+// a well-known value MUST be used where one applies. Gemini is reached at
+// generativelanguage.googleapis.com/...:generateContent, which is what
+// generate_content names and what scopes it to gcp.gemini rather than
+// gcp.vertex_ai (aiplatform.googleapis.com). The other three are chat APIs,
+// Bedrock included -- Converse is a chat operation.
+// tokenUsage is what a request cost, in the five figures the conventions name.
+// CacheRead and CacheWrite are parts of Input, not additions to it.
+type tokenUsage struct {
+	Input, Output, Reasoning, CacheRead, CacheWrite int
+}
+
+type usageAttr struct {
+	key   string
+	value int
+}
+
+// attrs names the usage in the conventions' vocabulary, in a fixed order so an
+// exported attribute list is stable rather than map-ordered.
+//
+// Input and Output are reported together whenever either is set, so any request
+// that reached a provider carries both. An output of zero is a measurement, not
+// a gap: a reasoning model that spends its entire budget before writing a word
+// reports exactly that, and it is the case this gateway exists to notice.
+//
+// The other three are reported only when non-zero. They are Recommended "when
+// applicable", and a provider with no cache and no reasoning has not measured
+// zero of them -- it has not measured them. Emitting zeros would put a number
+// on three-quarters of the fleet that means "unknown".
+func (u tokenUsage) attrs() []usageAttr {
+	if u.Input == 0 && u.Output == 0 {
+		return nil
+	}
+	out := []usageAttr{
+		{"gen_ai.usage.input_tokens", u.Input},
+		{"gen_ai.usage.output_tokens", u.Output},
+	}
+	for _, a := range []usageAttr{
+		{"gen_ai.usage.reasoning.output_tokens", u.Reasoning},
+		{"gen_ai.usage.cache_read.input_tokens", u.CacheRead},
+		{"gen_ai.usage.cache_write.input_tokens", u.CacheWrite},
+	} {
+		if a.value > 0 {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+type semconv struct{ provider, operation string }
+
+var semconvProviders = map[string]semconv{
+	"openai":    {"openai", "chat"},
+	"anthropic": {"anthropic", "chat"},
+	"gemini":    {"gcp.gemini", "generate_content"},
+	"bedrock":   {"aws.bedrock", "chat"},
+}
+
+// semconvOf falls back to the identifier unchanged with the default operation.
+// A fifth provider added before this table is updated then emits a value that
+// is merely unrecognised, which is what it was before; the alternative is an
+// empty required attribute, which is worse.
+func semconvOf(provider string) semconv {
+	if s, ok := semconvProviders[provider]; ok {
+		return s
+	}
+	return semconv{provider, "chat"}
+}
+
 func (t *Telemetry) spanOf(e Event) map[string]any {
+	sc := semconvOf(e.Provider)
 	attrs := []any{
-		map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": e.Provider}},
+		map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": sc.provider}},
+		// Required by the convention on both the span and the token-usage metric,
+		// and previously absent -- which is what made these spans non-conformant
+		// rather than merely sparse, since it is the primary grouping key.
+		map[string]any{"key": "gen_ai.operation.name", "value": map[string]any{"stringValue": sc.operation}},
 		map[string]any{"key": "http.response.status_code", "value": map[string]any{"intValue": strconv.Itoa(e.Status)}},
 		// What the routing loop decided, which the span used to drop on the floor.
 		// The metrics already count how often failover happens; without these,
@@ -833,7 +936,25 @@ func (t *Telemetry) spanOf(e Event) map[string]any {
 	if e.Fault != "" {
 		attrs = append(attrs, map[string]any{"key": "switchboard.fault", "value": map[string]any{"stringValue": e.Fault}})
 	}
-	span := map[string]any{"traceId": e.TraceID, "spanId": e.SpanID, "name": "switchboard.inference", "kind": 2, "startTimeUnixNano": strconv.FormatInt(e.Start, 10), "endTimeUnixNano": strconv.FormatInt(e.End, 10), "attributes": attrs}
+	// What the request cost, from the same table wire() reads, so the span and
+	// the control plane cannot disagree about the names.
+	for _, a := range e.Usage.attrs() {
+		attrs = append(attrs, map[string]any{"key": a.key, "value": map[string]any{"intValue": strconv.Itoa(a.value)}})
+	}
+	// "{gen_ai.operation.name} {gen_ai.request.model}", which the convention says
+	// a span name SHOULD be. The old name was switchboard.inference: correct
+	// about what this is and unreadable to anything that groups GenAI spans by
+	// the convention's shape.
+	//
+	// Model is empty on a request refused before any route was chosen, and
+	// "chat " with a trailing space is not a name. Fall back to the operation
+	// alone, which is still the convention's first half rather than a third
+	// vocabulary.
+	name := sc.operation
+	if e.Model != "" {
+		name += " " + e.Model
+	}
+	span := map[string]any{"traceId": e.TraceID, "spanId": e.SpanID, "name": name, "kind": 2, "startTimeUnixNano": strconv.FormatInt(e.Start, 10), "endTimeUnixNano": strconv.FormatInt(e.End, 10), "attributes": attrs}
 	if e.ParentID != "" {
 		span["parentSpanId"] = e.ParentID
 	}
