@@ -5,6 +5,7 @@ package gateway
 import (
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -261,4 +262,86 @@ func TestAnEmptyStreamStillNamesTheModelThatProducedNothing(t *testing.T) {
 	if got := e.Tries[1].ResponseModel; got != "claude-opus-5" {
 		t.Errorf("attempt 2 served by %q, want claude-opus-5", got)
 	}
+}
+
+// TestTheRouteHeaderNamesTheServedModelOnlyWhenItDiffers renders the header from
+// attempt records directly, so every shape the grammar has to hold is pinned
+// without a provider in the loop.
+func TestTheRouteHeaderNamesTheServedModelOnlyWhenItDiffers(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		event Event
+		want  string
+	}{
+		{"served as sent", Event{Tries: []attemptRecord{
+			{Order: 1, Provider: "openai", Model: "gpt-4o-mini", ResponseModel: "gpt-4o-mini", Status: 200}}},
+			"openai/gpt-4o-mini:200"},
+		{"served by a snapshot", Event{Tries: []attemptRecord{
+			{Order: 1, Provider: "openai", Model: "gpt-4o-mini", ResponseModel: "gpt-4o-mini-2024-07-18", Status: 200}}},
+			"openai/gpt-4o-mini=gpt-4o-mini-2024-07-18:200"},
+		{"an answer that named no model", Event{Tries: []attemptRecord{
+			{Order: 1, Provider: "bedrock", Model: "anthropic.claude-3-5-haiku-20241022-v1:0", Status: 200}}},
+			"bedrock/anthropic.claude-3-5-haiku-20241022-v1:0=?:200"},
+		{"a failed attempt has no answer to name a model in", Event{Tries: []attemptRecord{
+			{Order: 1, Provider: "openai", Model: "gpt-4o-mini", Status: 503, Fault: "degraded"}}},
+			"openai/gpt-4o-mini:503 degraded"},
+		{"a skip between two attempts", Event{
+			Tries: []attemptRecord{
+				{Order: 1, Provider: "openai", Model: "gpt-4o-mini", Status: 503},
+				{Order: 3, Provider: "anthropic", Model: "claude-sonnet-4", ResponseModel: "claude-sonnet-4-20250514", Status: 200}},
+			Skipped: []skippedRoute{{Order: 2, Provider: "gemini", Model: "gemini-2.0-flash", Reason: "circuit_open"}}},
+			"openai/gpt-4o-mini:503, gemini/gemini-2.0-flash:skipped circuit_open, anthropic/claude-sonnet-4=claude-sonnet-4-20250514:200"},
+		{"an empty answer still names its model", Event{Tries: []attemptRecord{
+			{Order: 1, Provider: "openai", Model: "gpt-5-nano", ResponseModel: "gpt-5-nano-2025-08-07", Status: 200, Fault: "empty_completion"}}},
+			"openai/gpt-5-nano=gpt-5-nano-2025-08-07:200 empty_completion"},
+		{
+			// The served value comes from the provider. Unsanitised, this one would
+			// add a hop, a status and a fault that never happened.
+			"a hostile served model", Event{Tries: []attemptRecord{
+				{Order: 1, Provider: "openai", Model: "gpt-4o-mini", ResponseModel: "x:200, evil/m=y:200 fault", Status: 200}}},
+			"openai/gpt-4o-mini=x:200__evil/m_y:200_fault:200"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.event.routeHeader(); got != tc.want {
+				t.Errorf("route header = %q\n            want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTheServedModelReachesTheRouteHeaderACallerReceives is about when, not what.
+// The header is first rendered as soon as the provider returns 200, before its
+// body has named a model, so it is rendered again just before the first byte.
+// Result() is read rather than the recorder's live header map: the recorder
+// snapshots headers when the first byte is written, which is what a caller gets,
+// and a header set after that would pass a check against the live map.
+func TestTheServedModelReachesTheRouteHeaderACallerReceives(t *testing.T) {
+	t.Run("complete response", func(t *testing.T) {
+		p := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, `{"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"message":{"content":"hi"},"finish_reason":"stop"}]}`)
+		}))
+		defer p.Close()
+		s := testServer(t, map[string]ProviderConfig{"openai": {URL: p.URL, KeyEnv: "PROVIDER_KEY"}})
+		got := call(s, chat).Result().Header.Get("X-Switchboard-Route")
+		if want := "openai/test-model=gpt-4o-mini-2024-07-18:200"; got != want {
+			t.Errorf("route header = %q, want %q", got, want)
+		}
+	})
+	t.Run("stream", func(t *testing.T) {
+		p := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "event: message_start\n"+
+				`data: {"type":"message_start","message":{"type":"message","role":"assistant","content":[],"model":"claude-opus-5"}}`+"\n\n"+
+				`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}`+"\n\n"+
+				`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`+"\n\n"+
+				`data: {"type":"message_stop"}`+"\n\n")
+		}))
+		defer p.Close()
+		s := testServer(t, map[string]ProviderConfig{"anthropic": {URL: p.URL, KeyEnv: "PROVIDER_KEY"}})
+		got := call(s, `{"model":"preferred","stream":true,"messages":[{"role":"user","content":"hi"}]}`).
+			Result().Header.Get("X-Switchboard-Route")
+		if want := "anthropic/test-model=claude-opus-5:200"; !strings.HasSuffix(got, want) {
+			t.Errorf("route header = %q, want it to end %q", got, want)
+		}
+	})
 }

@@ -1017,12 +1017,26 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		// Rendered from Event.Tries, so it is a view of bookkeeping the gateway
 		// already keeps rather than a second record that could disagree with it.
 		// Bounded by max_attempts, which config validation pins to 1..3.
-		if r := event.routeHeader(); r != "" {
-			w.Header().Set("X-Switchboard-Route", r)
+		setRoute := func() {
+			if r := event.routeHeader(); r != "" {
+				w.Header().Set("X-Switchboard-Route", r)
+			}
 		}
+		// Rendered now, for the paths that commit without reading a body, and
+		// rendered again just before the first byte of one. The answering attempt
+		// only says which model served it in that body, and a header is not sent
+		// until the first byte is, so the later render is the one a caller sees.
+		setRoute()
 
 		// Acceptance (HTTP 200) commits this generation. No body/stream error may fail over.
 		if c.Stream {
+			// stream() calls this before its first byte: the last moment the route
+			// header can change, and the first at which the stream has named the
+			// model serving it.
+			streamed.beforeFirstByte = func() {
+				event.servedBy(streamed.model)
+				setRoute()
+			}
 			err := s.stream(w, res, route, id, start.Unix(), &streamed)
 			res.Body.Close()
 			if errors.Is(err, errStreamEmpty) {
@@ -1109,6 +1123,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		s.circuits[route.Provider].result(e != nil)
 		if e != nil {
 			idemSettled = s.settleUnknown(idemKey, hashBody(b))
+			setRoute()
 			fail(502, "unsupported or incomplete provider response; not replayed")
 			return
 		}
@@ -1144,6 +1159,8 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		event.Status = 200
 		body := jsonBytes(completion(id, route, n, start.Unix()))
 		capturedCompletion = body
+		// After servedBy above, so the attempt that answered names its model.
+		setRoute()
 		if idemKey != "" {
 			s.Idem.finish(idemKey, &idemEntry{
 				State: idemDone, BodyHash: hashBody(b), Stored: time.Now().Unix(),
@@ -1204,6 +1221,13 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 	// Providers repeat cumulative usage on every frame, so without this a single
 	// response would be counted as several mismatches.
 	mismatchCounted := false
+	// commit runs the caller's first-byte hook, once, before anything is written.
+	commit := func() {
+		if !wrote && out != nil && out.beforeFirstByte != nil {
+			out.beforeFirstByte()
+			out.beforeFirstByte = nil
+		}
+	}
 	err := readSSE(body, func(b []byte) error {
 		if string(b) == "[DONE]" {
 			if route.Provider != "openai" || !finished {
@@ -1239,6 +1263,7 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 				return nil
 			}
 			rc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			commit()
 			if e := writeSSE(w, ch); e != nil {
 				return e
 			}
@@ -1271,12 +1296,14 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 				return e
 			}
 		}
+		commit()
 		_, e := fmt.Fprint(w, "data: [DONE]\n\n")
 		if e == nil {
 			e = rc.Flush()
 		}
 		return e
 	}
+	commit()
 	writeSSE(w, map[string]any{"error": map[string]any{"message": "upstream stream interrupted; do not automatically replay", "type": "stream_error", "request_id": id}})
 	if err == nil {
 		err = io.ErrUnexpectedEOF
@@ -1582,6 +1609,9 @@ type streamResult struct {
 	// repeats it on every chunk and Anthropic states it once, in message_start,
 	// so a frame without it must not clear it.
 	model string
+	// beforeFirstByte, when set, runs once just before stream() writes its first
+	// byte to the caller: the last moment a response header can still change.
+	beforeFirstByte func()
 }
 
 // settleUnknown marks a key ambiguous. Deliberately sticky: releasing it would

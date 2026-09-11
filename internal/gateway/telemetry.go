@@ -1713,6 +1713,45 @@ func (t *Telemetry) postSpans(ctx context.Context, spans []any) {
 	}
 }
 
+// servedSuffix is what routeHeader appends to an attempt's model: the served
+// model when a 2xx answer named one other than the model sent, "=?" when it named
+// none, and nothing otherwise. A failed attempt has no answer to name a model in.
+func servedSuffix(t attemptRecord) string {
+	if t.Status < 200 || t.Status > 299 {
+		return ""
+	}
+	switch t.ResponseModel {
+	case "":
+		return "=?"
+	case t.Model:
+		return ""
+	}
+	return "=" + headerToken(t.ResponseModel)
+}
+
+// headerToken makes a provider-supplied value safe inside the route header. The
+// value is untrusted, and the header is a grammar the console and scripts parse:
+// a comma, an equals sign or a space would forge a hop, and a control character
+// has no business in a header at all. Anything outside the characters model
+// identifiers use -- the colon included, because Bedrock's contain one -- becomes
+// an underscore, and the result is capped.
+func headerToken(s string) string {
+	const limit = 128
+	b := []byte(s)
+	if len(b) > limit {
+		b = b[:limit]
+	}
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '.', c == '_', c == ':', c == '/', c == '@', c == '-':
+		default:
+			b[i] = '_'
+		}
+	}
+	return string(b)
+}
+
 // routeHeader renders the route the request actually took, as one line for
 // X-Switchboard-Route:
 //
@@ -1728,6 +1767,11 @@ func (t *Telemetry) postSpans(ctx context.Context, spans []any) {
 // reader who cannot see that concludes either that failover is rare or that the
 // count is wrong.
 //
+// A 2xx attempt also says what served it when that is news: "=<model>" when the
+// provider named a model other than the one sent, "=?" when it named none.
+//
+//	openai/gpt-4o-mini=gpt-4o-mini-2024-07-18:200
+//
 // A status of 0 means the attempt never got one -- a transport failure or a
 // timeout -- and is rendered as "-" rather than as a number no provider sent.
 func (e Event) routeHeader() string {
@@ -1736,6 +1780,8 @@ func (e Event) routeHeader() string {
 		provider string
 		model    string
 		outcome  string
+		// served follows the model: see servedSuffix.
+		served string
 	}
 	steps := make([]step, 0, len(e.Tries)+len(e.Skipped))
 	for _, t := range e.Tries {
@@ -1746,10 +1792,10 @@ func (e Event) routeHeader() string {
 		if t.Fault != "" {
 			out += " " + t.Fault
 		}
-		steps = append(steps, step{t.Order, t.Provider, t.Model, out})
+		steps = append(steps, step{t.Order, t.Provider, t.Model, out, servedSuffix(t)})
 	}
 	for _, sk := range e.Skipped {
-		steps = append(steps, step{sk.Order, sk.Provider, sk.Model, "skipped " + sk.Reason})
+		steps = append(steps, step{sk.Order, sk.Provider, sk.Model, "skipped " + sk.Reason, ""})
 	}
 	if len(steps) == 0 {
 		return ""
@@ -1765,6 +1811,9 @@ func (e Event) routeHeader() string {
 		if st.model != "" {
 			b.WriteString("/")
 			b.WriteString(st.model)
+		}
+		if st.served != "" {
+			b.WriteString(st.served)
 		}
 		b.WriteString(":")
 		b.WriteString(st.outcome)
