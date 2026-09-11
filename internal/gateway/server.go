@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/bits"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -44,11 +45,45 @@ func (b *bucket) allow() bool {
 	return true
 }
 
+// flapWindow and flapFailures are the second rule the breaker needs.
+//
+// failures below is a consecutive count, reset by any success, which is exactly
+// right for a hard outage and blind to the failure mode that lasts longest: a
+// provider that fails every other request never reaches three, so the circuit
+// never opens and it stays in rotation indefinitely -- costing a wasted upstream
+// call, a jittered delay and one of three attempts on half of all traffic, with
+// nothing saying so.
+//
+// The floor of a full window makes the denominator fixed, which is what turns
+// the rule into a rate rather than a count. Without it the threshold is reached
+// as soon as eight failures have happened at all: measured, an alternating
+// provider trips it at the fifteenth observation, so "eight failures" means 53%
+// on one run and 40% on another and the rule silently means something different
+// each time.
+//
+// It cannot be justified the way it is tempting to -- that two failures at
+// startup would otherwise read as a 100% failure rate -- because three in a row
+// opens the circuit on the consecutive rule first. The floor earns its place on
+// the denominator alone.
+//
+// 40% rather than something tighter because failover is already absorbing these
+// and the caller is being served. The bar is "this provider is costing an
+// attempt on a large share of requests", not "this provider is imperfect".
+const (
+	flapWindow   = 20
+	flapFailures = 8
+)
+
 type circuit struct {
 	mu       sync.Mutex
 	failures int
 	until    time.Time
 	probe    bool
+	// recent holds the last flapWindow outcomes, one bit each, newest in the low
+	// bit. seen counts how many of those slots are real, so the rule cannot fire
+	// before there is a window to judge.
+	recent uint32
+	seen   int
 }
 
 func (c *circuit) allow() bool {
@@ -85,16 +120,51 @@ func (c *circuit) wouldAllow() bool {
 func (c *circuit) result(failed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// allow() sets probe only for the one request let through after an open
+	// window expires, so this is exactly "was this the recovery probe".
+	recovered := c.probe
 	c.probe = false
 	if !failed {
 		c.failures = 0
 		c.until = time.Time{}
+		if recovered {
+			// The probe answered, so the window that opened the circuit is
+			// history. Without this the very next request re-opens on evidence
+			// about a provider that has since recovered -- a ratchet rather than
+			// a breaker, and worse than the defect the rolling rule fixes.
+			c.recent, c.seen = 0, 0
+			return
+		}
+		// An ordinary success is evidence too, and has to enter the window or
+		// the rolling rule can never see a provider that alternates: every
+		// success would wipe the record of the failure before it.
+		c.recent <<= 1
+		if c.seen < flapWindow {
+			c.seen++
+		}
 		return
 	}
 	c.failures++
-	if c.failures >= 3 {
+	c.recent = (c.recent << 1) | 1
+	if c.seen < flapWindow {
+		c.seen++
+	}
+	// Two rules, because they detect different things and neither covers the
+	// other: three in a row is a provider that is down, and a large share of a
+	// recent window is a provider that is unreliable. What happens next is the
+	// same, so they open the same door.
+	if c.failures >= 3 || c.flapping() {
 		c.until = time.Now().Add(15 * time.Second)
 	}
+}
+
+// flapping reports whether a large share of a full recent window failed. Caller
+// holds the mutex.
+func (c *circuit) flapping() bool {
+	if c.seen < flapWindow {
+		return false
+	}
+	return bits.OnesCount32(c.recent&(1<<flapWindow-1)) >= flapFailures
 }
 func (c *circuit) release() { c.mu.Lock(); c.probe = false; c.mu.Unlock() }
 

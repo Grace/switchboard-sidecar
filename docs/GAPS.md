@@ -479,6 +479,44 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     than on blips. That is worth stating, because it is the reason not to spend
     anything chasing faster propagation.
 
+26. **The breaker could not see a provider that fails half the time.**
+    `circuit.failures` is a consecutive count reset by any success, which is
+    exactly right for a hard outage and blind to the failure mode that lasts
+    longest: a provider failing every other request never reaches three, so the
+    circuit never opens and it stays in rotation indefinitely -- a wasted upstream
+    call, a jittered delay and one of three attempts on half of all traffic, with
+    no counter saying so.
+
+    Single blips were already handled and are unchanged. One or two failures then
+    a success reset the counter, the breaker stays closed, and failover has
+    already served the caller. The design refuses to over-react in three places
+    on purpose -- the threshold of three, the quorum before a `degraded` report
+    moves the fleet, and the hint TTL -- and that refusal is the correct
+    treatment for a blip.
+
+    So a second rule sits beside the first rather than replacing it: three in a
+    row means down, and eight of the last twenty means unreliable. Both open the
+    same fifteen seconds, because what happens next is the same.
+
+    **The trap is the ratchet.** After the rolling rule opens the circuit, the
+    probe succeeds and the window still holds eight failures, so the next request
+    re-opens on evidence about a provider that has since recovered. A successful
+    probe clears the window; without that the fix is worse than the defect.
+
+    **Two of the four mutation checks initially proved nothing**, which is the
+    more useful finding. Two tests drove `circuit.result` directly, bypassing
+    `allow()`, letting a success land during an open window -- impossible in the
+    real path, and it quietly cleared the state under test. And the floor test
+    asserted on two failures, which never reach a threshold of eight, so it
+    passed with the floor removed.
+
+    The floor's justification was wrong as first written, too. It is not that two
+    failures at startup read as 100%: three in a row opens on the consecutive rule
+    first. It is that without a fixed denominator the threshold is reached as soon
+    as eight failures exist at all -- measured, at the fifteenth observation for an
+    alternating provider -- so the same constant means 53% on one run and 40% on
+    another.
+
 ## Still open
 
 1. **Deployment is proven for the quickstart only.** `quickstart.yaml` has been

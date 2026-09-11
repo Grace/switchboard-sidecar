@@ -97,3 +97,113 @@ func TestMetricsHistogram(t *testing.T) {
 		t.Errorf("token metric emitted with no tokens counted:\n%s", body)
 	}
 }
+
+// The failure mode a consecutive-failure breaker cannot see.
+//
+// failures is reset by any success, so a provider that fails every other request
+// never reaches three and the circuit never opens. It stays in rotation
+// indefinitely, costing a wasted upstream call, a jittered delay and one of
+// three attempts on half of all traffic, with nothing recording that it is
+// happening. This is the longest-lasting failure a provider can have and it was
+// invisible.
+func TestBreakerOpensOnAProviderThatFailsHalfTheTime(t *testing.T) {
+	c := &circuit{}
+	// Driven through allow(), because that is what decides whether a request
+	// reaches the provider at all. Calling result() directly would let a success
+	// land during an open window, which the real path makes impossible and which
+	// quietly clears the state under test.
+	consecutive := 0
+	for i := 0; c.allow() && i < flapWindow*2; i++ {
+		failed := i%2 == 0 // fail, succeed, fail, succeed...
+		c.result(failed)
+		c.mu.Lock()
+		if c.failures > consecutive {
+			consecutive = c.failures
+		}
+		open := !c.until.IsZero()
+		c.mu.Unlock()
+		if open {
+			if consecutive >= 3 {
+				t.Fatalf("opened on %d consecutive failures; the fixture is not alternating", consecutive)
+			}
+			return // opened on the rolling rule, which is the point
+		}
+	}
+	t.Errorf("a provider failing every other request never opened the circuit; "+
+		"the consecutive counter peaked at %d and is reset by every success", consecutive)
+}
+
+// And the behaviour that must not change: a blip is absorbed by failover, and
+// the breaker deliberately does not react to it.
+func TestASingleBlipLeavesTheCircuitClosed(t *testing.T) {
+	c := &circuit{}
+	c.result(true)
+	c.result(false)
+	if !c.allow() {
+		t.Error("one failure followed by a success closed the circuit; the breaker has become twitchy")
+	}
+}
+
+// The floor makes the threshold a rate rather than a count.
+//
+// An alternating provider reaches eight failures at the fifteenth observation.
+// Firing there would mean "8 of 15", or 53%, while the same rule on a longer run
+// means "8 of 20", or 40% -- the same constant quietly meaning something
+// different depending on when it happened to be reached. The floor fixes the
+// denominator so the number means one thing.
+//
+// This test exists because the first version of it asserted nothing: two
+// failures never reach a threshold of eight, so it passed with the floor removed
+// and only the mutation check noticed.
+func TestTheRollingRuleWaitsForAFullWindow(t *testing.T) {
+	c := &circuit{}
+	// Fourteen observations: seven failures alternating with successes. One more
+	// failure reaches eight, which is the threshold, at seen = 15.
+	for i := 0; i < 14; i++ {
+		c.result(i%2 == 0)
+	}
+	c.result(true) // the eighth failure, at the fifteenth observation
+
+	c.mu.Lock()
+	open, seen := !c.until.IsZero(), c.seen
+	c.mu.Unlock()
+	if open {
+		t.Errorf("opened at %d observations: eight failures out of %d is 53%%, not the 40%% "+
+			"the threshold is meant to express", seen, seen)
+	}
+}
+
+// A breaker, not a ratchet. When the probe that follows an open window succeeds,
+// the window that opened it is history -- otherwise the next request re-opens on
+// evidence about a provider that has since recovered, and it is withheld
+// forever.
+func TestASuccessfulProbeForgetsTheWindow(t *testing.T) {
+	c := &circuit{}
+	for i := 0; c.allow() && i < flapWindow*2; i++ {
+		c.result(i%2 == 0)
+	}
+	c.mu.Lock()
+	if c.until.IsZero() {
+		c.mu.Unlock()
+		t.Fatal("fixture did not open the circuit")
+	}
+	// Let the open window lapse, then take the probe allow() reserves.
+	c.until = time.Now().Add(-time.Millisecond)
+	c.mu.Unlock()
+
+	if !c.allow() {
+		t.Fatal("no probe was allowed after the open window expired")
+	}
+	c.result(false) // the probe answers
+
+	c.mu.Lock()
+	seen, recent := c.seen, c.recent
+	c.mu.Unlock()
+	if seen != 0 || recent != 0 {
+		t.Errorf("after a successful probe the window still holds %d observations (%b); "+
+			"the provider would be re-opened on history", seen, recent)
+	}
+	if !c.allow() {
+		t.Error("the provider is still withheld after recovering")
+	}
+}
