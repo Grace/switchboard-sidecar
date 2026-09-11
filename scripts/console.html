@@ -1,0 +1,303 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>s.witchboard.ai — send a prompt, watch it route</title>
+<link rel="icon" href="data:,">
+
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f7f7f5; --panel: #fff; --ink: #17181a; --dim: #5d646c; --faint: #8d949c;
+  --line: #e0e2e5; --accent: #185e54; --warn: #9a4b1f; --bad: #9e2f26; --ok: #1f6b46;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --openai: #2f6f62; --anthropic: #8a5a2b; --gemini: #35608c; --bedrock: #6b4a80; --other: #6c7076;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131517; --panel: #1b1e21; --ink: #e9ebed; --dim: #a6adb4; --faint: #767d85;
+    --line: #2a2e33; --accent: #5fbfae; --warn: #d99457; --bad: #ec8279; --ok: #6cc493;
+    --openai: #5fbfae; --anthropic: #d4a06a; --gemini: #7aa9d6; --bedrock: #ab8ac4; --other: #8a9098;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 2.5rem 1.5rem 5rem; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 58rem; margin: 0 auto; }
+h1 { margin: 0 0 .35rem; font-size: 1.6rem; letter-spacing: -.015em; }
+.sub { margin: 0 0 1.75rem; color: var(--dim); max-width: 44rem; }
+code { font-family: var(--mono); font-size: .9em; }
+
+form { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.1rem 1.25rem; }
+label { display: block; font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); margin-bottom: .35rem; }
+textarea { width: 100%; min-height: 5.5rem; font: inherit; padding: .6rem .7rem; resize: vertical;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+.row { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-end; margin-top: .9rem; }
+input[type=number] { width: 7rem; font: inherit; padding: .4rem .5rem; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg); color: var(--ink); }
+button { font: inherit; padding: .5rem 1rem; border: 1px solid var(--accent); border-radius: 6px;
+  background: var(--accent); color: #fff; cursor: pointer; }
+button[disabled] { opacity: .55; cursor: progress; }
+.fixed { font-family: var(--mono); font-size: .82rem; color: var(--dim); padding: .4rem .5rem;
+  border: 1px dashed var(--line); border-radius: 6px; }
+
+section { margin-top: 1.75rem; }
+
+.banner { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--warn);
+  border-radius: 8px; padding: .8rem 1rem; margin-bottom: 1.5rem; font-size: .86rem; color: var(--dim); }
+.banner strong { color: var(--ink); }
+
+.fits { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--line); }
+.dia { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: 1rem 0 1.25rem;
+  font: .8rem/1 var(--mono); }
+.dia .box { display: inline-block; padding: .45rem .6rem; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--panel); }
+.dia .box.pub { border-style: dashed; color: var(--dim); }
+.dia .to { color: var(--faint); display: inline-flex; align-items: center; gap: .35rem; }
+.dia .to em { font-style: normal; font-size: .72rem; }
+.dia .tenant { display: inline-flex; flex-wrap: wrap; align-items: center; gap: .5rem; position: relative;
+  padding: .9rem .7rem .7rem; border: 1px solid var(--accent); border-radius: 8px; }
+.dia .edge { position: absolute; top: -.55rem; left: .6rem; background: var(--bg); padding: 0 .35rem;
+  font-size: .66rem; color: var(--accent); letter-spacing: .02em; }
+h2 { font-size: .95rem; margin: 0 0 .2rem; }
+.lede { margin: 0 0 1rem; font-size: .83rem; color: var(--dim); max-width: 44rem; }
+
+/* the route chain */
+.chain { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0; }
+.hop { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--other);
+  border-radius: 8px; padding: .6rem .8rem; min-width: 12rem; }
+.hop .who { font: 600 .85rem/1.3 var(--mono); }
+.hop .what { font-size: .75rem; color: var(--dim); margin-top: .15rem; }
+.hop .cost { font-size: .75rem; color: var(--faint); margin-top: .3rem; font-variant-numeric: tabular-nums; }
+.hop.answered { border-left-color: var(--ok); }
+.hop.gaveup { border-left-color: var(--bad); }
+.arrow { display: flex; flex-direction: column; justify-content: center; align-items: center;
+  padding: 0 .7rem; min-width: 8rem; }
+.arrow .kind { font: 600 .68rem/1 var(--mono); text-transform: uppercase; letter-spacing: .06em; }
+.arrow .why { font-size: .7rem; color: var(--dim); margin-top: .25rem; text-align: center; }
+.arrow.failover .kind { color: var(--warn); }
+.arrow.retry .kind { color: var(--accent); }
+.arrow .line { font-size: 1.1rem; color: var(--faint); line-height: 1; margin-top: .2rem; }
+
+.badges { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .9rem; }
+.badge { font: 600 .7rem/1 var(--mono); padding: .3rem .5rem; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--dim); }
+.badge.good { color: var(--ok); border-color: var(--ok); }
+
+pre { margin: 0; padding: 1rem; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; overflow: auto; max-height: 22rem; font-family: var(--mono);
+  font-size: .78rem; line-height: 1.5; white-space: pre-wrap; }
+.answer { white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 1rem; }
+.err { color: var(--bad); }
+.note { font-size: .8rem; color: var(--faint); margin-top: 1rem; max-width: 46rem; }
+details summary { cursor: pointer; font-size: .84rem; color: var(--dim); margin-top: 1rem; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+
+<main>
+  <div class="banner">
+    <strong>The provider is a mock.</strong> The routing is not: a real gateway
+    reads a real signed policy, really fails over, really retries, and really counts
+    tokens. What is simulated is the <em>answer</em> — the mock returns canned text
+    instead of calling OpenAI or Anthropic. That is also why you can watch a failover
+    on the first click rather than waiting for somebody's outage.
+  </div>
+
+  <h1>Send a prompt, watch it route</h1>
+  <p class="sub">This talks to a real gateway. The chain below is built from the response's
+    own headers, so it is what actually happened to this request — which provider answered,
+    whether an earlier one was tried first, and why that one gave up.</p>
+
+  <form id="f">
+    <label for="p">Prompt</label>
+    <textarea id="p">Explain what a circuit breaker does, in two sentences.</textarea>
+    <div class="row">
+      <div>
+        <label for="mt">Max tokens</label>
+        <input id="mt" type="number" value="256" min="1" max="4096">
+      </div>
+      <div>
+        <label>Model</label>
+        <div class="fixed">preferred</div>
+      </div>
+      <button id="go" type="submit">Send</button>
+    </div>
+    <p class="note">The model is not yours to choose, and that is the design: the gateway
+      rejects any model but <code>preferred</code>, because a <em>signed</em> routing policy
+      decides which provider and model serve the request. That is what makes the routing
+      auditable rather than a client-side preference.</p>
+  </form>
+
+  <div id="out"></div>
+
+  <section class="fits">
+    <h2>Where this sits</h2>
+    <div class="dia" role="img" aria-label="The internet reaches your agent; your agent calls switchboard on localhost; switchboard calls the providers. The provider keys stay inside the task.">
+      <span class="box pub">the internet</span>
+      <span class="to">&rarr;</span>
+      <span class="box pub">your agent</span>
+      <span class="to">&rarr;<em>127.0.0.1</em></span>
+      <span class="tenant">
+        <span class="box">switchboard</span>
+        <span class="to">&rarr;</span>
+        <span class="box">providers</span>
+        <span class="edge">one task &middot; keys never leave it</span>
+      </span>
+    </div>
+    <p class="lede">Switchboard is a <strong>sidecar</strong>: it runs beside your
+      application in the same task or pod and listens on loopback only, so your agent
+      reaches it at <code>127.0.0.1</code> and nothing else can. Your agent is the
+      internet-facing part; the process holding the provider API keys never is. It is
+      the same shape as Envoy, Linkerd or the OpenTelemetry collector.</p>
+    <p class="lede">One sidecar serves one tenant — the tenant is in its config and the
+      routing policy it fetches is signed for that tenant. Loopback is how that is
+      enforced today, which is why the gateway refuses to bind anything else:
+      <code>listen must be a loopback IP:port; use one sidecar per tenant</code>.</p>
+    <p class="lede"><strong>Today that is the only shape.</strong> There is no endpoint
+      to send your production traffic to: you deploy it, it runs next to your code, and
+      the only thing leaving your task is the call to the provider you chose. Nobody is
+      in the path of your prompts, including us.</p>
+    <p class="lede"><strong>Planned:</strong> a network-facing single-tenant deployment,
+      so one gateway can serve a team rather than one per service — reached over mTLS,
+      with the caller proven by certificate instead of by being on the same loopback
+      interface. And a hosted option for people who would rather not run it at all.
+      Neither exists yet, and the roadmap for both is in <code>docs/GAPS.md</code> with
+      what each actually requires.</p>
+  </section>
+</main>
+
+<script>
+const $ = (h) => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstElementChild }
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
+const PROVIDERS = ['openai', 'anthropic', 'gemini', 'bedrock']
+const hue = (p) => `var(--${PROVIDERS.includes(p) ? p : 'other'})`
+
+// Plain words for the fault names the gateway puts on an attempt.
+const FAULT = {
+  refused: 'the provider declined the request before generating anything',
+  account: 'the account cannot serve — no credits, or suspended',
+  degraded: 'the provider itself was failing',
+  terminal: 'this provider will not serve this request, and no other would either',
+  rate_limited: 'rate limited',
+  empty_completion: 'it answered with no text at all, and billed for it',
+}
+
+/**
+ * Parse X-Switchboard-Route into attempts.
+ *
+ *   openai/gpt-4o-mini:200 empty_completion, anthropic/claude-sonnet-4:200
+ *
+ * Deliberately tolerant: an unparseable entry is shown raw rather than dropped,
+ * because silently losing an attempt would understate what a request cost.
+ */
+function parseRoute(header) {
+  if (!header) return []
+  return header.split(',').map((part) => {
+    const raw = part.trim()
+    const m = raw.match(/^([^/:]+)(?:\/([^:]+))?:([0-9-]+)(?:\s+(.*))?$/)
+    if (!m) return { raw, provider: raw, model: '', status: '', fault: '' }
+    return { raw, provider: m[1], model: m[2] || '', status: m[3], fault: m[4] || '' }
+  })
+}
+
+function renderChain(attempts) {
+  const chain = $(`<div class="chain"></div>`)
+  attempts.forEach((a, i) => {
+    const last = i === attempts.length - 1
+    const hop = $(`<div class="hop ${last ? 'answered' : 'gaveup'}">
+      <div class="who">${esc(a.provider)}${a.model ? ' / ' + esc(a.model) : ''}</div>
+      <div class="what">${a.status === '-' ? 'no response' : 'HTTP ' + esc(a.status)}${
+        last ? ' — answered this request' : ''}</div>
+    </div>`)
+    hop.style.borderLeftColor = last ? 'var(--ok)' : 'var(--bad)'
+    if (!last) hop.style.borderLeftColor = 'var(--bad)'
+    chain.append(hop)
+
+    if (!last) {
+      const next = attempts[i + 1]
+      // Same provider and model again is a retry of one route; a different
+      // provider is a failover to the next route in the policy. Both increment
+      // the attempt count, and they mean quite different things.
+      const isRetry = next.provider === a.provider && next.model === a.model
+      const why = a.fault ? (FAULT[a.fault] || a.fault.replace(/_/g, ' ')) : 'it did not answer usably'
+      chain.append($(`<div class="arrow ${isRetry ? 'retry' : 'failover'}">
+        <span class="kind">${isRetry ? 'retry' : 'failover'}</span>
+        <span class="line">&rarr;</span>
+        <span class="why">${esc(why)}</span>
+      </div>`))
+    }
+  })
+  return chain
+}
+
+function render(res) {
+  const out = document.getElementById('out')
+  out.innerHTML = ''
+  const h = res.headers || {}
+  const attempts = parseRoute(h['X-Switchboard-Route'])
+
+  const sec = $(`<section></section>`)
+  sec.append($(`<h2>How it was routed</h2>`))
+
+  if (!attempts.length) {
+    sec.append($(`<p class="lede">This request never reached a provider — the gateway
+      answered it itself with HTTP ${res.status}. A policy refusal, an auth failure or a
+      rate limit all end here, and none of them cost a token.</p>`))
+  } else if (attempts.length === 1) {
+    sec.append($(`<p class="lede">One provider, first time. No retry and no failover —
+      which is what most requests should look like.</p>`))
+    sec.append(renderChain(attempts))
+  } else {
+    sec.append($(`<p class="lede">${attempts.length} attempts. Read it left to right: each
+      box is a provider that was asked, and each arrow says why the gateway moved on.</p>`))
+    sec.append(renderChain(attempts))
+  }
+
+  const badges = $(`<div class="badges"></div>`)
+  if (h['X-Switchboard-Attempts']) badges.append($(`<span class="badge">attempts ${esc(h['X-Switchboard-Attempts'])}</span>`))
+  if (h['X-Switchboard-Provider']) badges.append($(`<span class="badge">answered by ${esc(h['X-Switchboard-Provider'])}</span>`))
+  if (h['X-Switchboard-Replayed']) badges.append($(`<span class="badge good">served from the idempotency store — no provider was called</span>`))
+  if (h['X-Switchboard-Prompt-Cache']) badges.append($(`<span class="badge good">prompt cache: ${esc(h['X-Switchboard-Prompt-Cache'])}</span>`))
+  if (badges.children.length) sec.append(badges)
+  out.append(sec)
+
+  // The answer, or the refusal, whichever it was.
+  const ans = $(`<section><h2>${res.status === 200 ? 'The answer' : 'What the gateway said'}</h2></section>`)
+  let text = res.body
+  try {
+    const j = JSON.parse(res.body)
+    text = j?.choices?.[0]?.message?.content ?? j?.error?.message ?? res.body
+  } catch (e) { /* not JSON: show it as it came */ }
+  ans.append($(`<div class="answer${res.status === 200 ? '' : ' err'}">${esc(text)}</div>`))
+  out.append(ans)
+
+  const raw = $(`<details><summary>The response headers this page is built from</summary></details>`)
+  raw.append($(`<pre>${esc(Object.entries(h).map(([k, v]) => k + ': ' + v).join('\\n') || '(none)')}</pre>`))
+  out.append(raw)
+}
+
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault()
+  const go = document.getElementById('go')
+  go.disabled = true
+  go.textContent = 'Sending…'
+  document.getElementById('out').innerHTML = ''
+  try {
+    const r = await fetch('/send', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'preferred',
+        max_tokens: Number(document.getElementById('mt').value) || 256,
+        messages: [{ role: 'user', content: document.getElementById('p').value }],
+      }),
+    })
+    render(await r.json())
+  } catch (err) {
+    document.getElementById('out').innerHTML = ''
+    document.getElementById('out').append($(`<p class="err">${esc(String(err))}</p>`))
+  } finally {
+    go.disabled = false
+    go.textContent = 'Send'
+  }
+})
+</script>

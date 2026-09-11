@@ -41,6 +41,7 @@ services:
     command: ["sleep", "infinity"]
     ports:
       - "18000:8000"   # control plane, for poking at from the host
+      - "18090:8090"   # the prompt console
     healthcheck:
       test: ["CMD", "true"]
       interval: 2s
@@ -90,6 +91,40 @@ services:
     depends_on:
       taskns: {condition: service_started}
 
+  # A second mock that answers nothing but 503. The first one cannot do this
+  # selectively -- its failure injection is global -- and a failover that cannot
+  # be triggered on demand cannot be shown. Pointing one provider at this makes
+  # the gateway route around it for real.
+  brokenprovider:
+    image: python:3.14-slim
+    network_mode: "service:taskns"
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      MOCK_HOST: 127.0.0.1
+      MOCK_PORT: "9091"
+      MOCK_STATUS: "503"
+    command: ["python", "/scripts/mockprovider.py"]
+    depends_on:
+      taskns: {condition: service_started}
+
+  # Send a prompt, see the route it took. Joins the task namespace so it can
+  # reach the gateway on loopback -- which is the only way anything can, since
+  # the gateway binds 127.0.0.1 and Docker cannot publish a container's
+  # loopback. Serves on 0.0.0.0 so a browser on the host can reach it.
+  console:
+    image: python:3.14-slim
+    network_mode: "service:taskns"
+    env_file: [.dev/env]
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      CONSOLE_PORT: "8090"
+      GATEWAY_URL: http://127.0.0.1:8080
+    command: ["python", "/scripts/console.py"]
+    depends_on:
+      taskns: {condition: service_started}
+
   # Provisions tenant, principals and the signed policy, then writes the gateway
   # config. Runs inside the namespace so it can reach the control plane.
   devtools:
@@ -128,6 +163,8 @@ services:
       # Never reached: the policy routes to the mock. Present because config
       # validation requires every configured provider's key env to be non-empty.
       OPENAI_API_KEY: unused-local-placeholder
+      ANTHROPIC_API_KEY: unused-local-placeholder
+      GEMINI_API_KEY: unused-local-placeholder
     volumes:
       - gwdata:/data
       - gwconfig:/config:ro

@@ -295,9 +295,18 @@ def cmd_init(args):
         "control_token_env": "CONTROL_TOKEN",
         "local_token_env": "LOCAL_TOKEN",
         "trusted_keys": {os.environ["POLICY_KEY_ID"]: os.environ["POLICY_PUBLIC_KEY"]},
+        # All three at the same mock, which speaks all three request shapes on
+        # different paths -- so each exercises its own adapter and its own
+        # response parser rather than three names for one code path. The fourth
+        # entry is the always-503 mock, which exists so a failover can be
+        # demonstrated on demand instead of waited for.
         "providers": {
             "openai": {"url": os.environ.get("MOCK_URL", "http://127.0.0.1:9090"),
-                       "key_env": "OPENAI_API_KEY"}
+                       "key_env": "OPENAI_API_KEY"},
+            "anthropic": {"url": os.environ.get("MOCK_URL", "http://127.0.0.1:9090"),
+                          "key_env": "ANTHROPIC_API_KEY"},
+            "gemini": {"url": os.environ.get("BROKEN_MOCK_URL", "http://127.0.0.1:9091"),
+                       "key_env": "GEMINI_API_KEY"},
         },
         "concurrency": 32,
         "rate": 50,
