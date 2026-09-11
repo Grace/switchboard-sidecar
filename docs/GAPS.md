@@ -1220,6 +1220,42 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     `current_setting('app.tenant')`. The tenancy model exists. It is the gateway
     that assumes one.
 
+24. **The model that served a request, now recorded -- except on Bedrock, which
+    does not say.** Providers answer a request for one model name with another:
+    OpenAI reports the dated snapshot behind an alias, Gemini a `modelVersion`.
+    The gateway read neither. Spans carried `gen_ai.request.model` -- what was
+    sent -- and nothing about what answered, so a provider repointing an alias at
+    a new snapshot changed nothing in this telemetry while latency, token counts
+    and empty completions could all move with it.
+
+    Each attempt now records the provider's own statement of the model:
+    `ResponseModel` on the attempt record, `response_model` in `ext.tries` and at
+    the top of `ext`, and `gen_ai.response.model` on the span. Where the provider
+    said nothing the field is absent, never copied from the requested model; a
+    copy would report exactly the continuity the attribute exists to check.
+
+    **Bedrock cannot be covered.** The Converse response has no model field --
+    its members are `output`, `stopReason`, `usage`, `metrics`, `trace`,
+    `performanceConfig`, `serviceTier` and `additionalModelResponseFields` -- so a
+    Bedrock span never carries `gen_ai.response.model`, and the model ID in the
+    signed policy is the only record of what served the request.
+
+    **The caller still sees the routed model.** `completion()` and `chunk()`
+    write `route.Model` into the response body's `model`, so an application
+    instrumenting its own OpenAI client records the policy's model name as the
+    served one. Reporting the provider's value there changes a field callers may
+    match on, and is a decision rather than a fix.
+
+    Verified: decoding against Anthropic's documented `message_start` frame,
+    Gemini's documented `modelVersion` field and the OpenAI response shape
+    genai-interlingua's captures use, and per-attempt attribution through the
+    real route loop, including failover and a stream whose later frames are
+    silent. Not yet run against live traffic. `TestLiveNonStreaming` and
+    `TestLiveStreaming` now fail when OpenAI, Anthropic or Gemini names no served
+    model, which settles the two open questions: whether Anthropic's `model`
+    resolves an alias or echoes it, and whether Gemini states `modelVersion` on
+    stream chunks.
+
 ## Blocked externally
 
 These need an action from the owner or from AWS. **They are not implementation

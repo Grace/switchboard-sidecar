@@ -1042,6 +1042,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				// no tokens: the waste invisible, and its cost silently folded
 				// into whichever provider answered.
 				event.recordUsage(streamed.usage)
+				event.servedBy(streamed.model)
 				event.endTry(res.StatusCode, "empty_completion", time.Now().UnixNano())
 				s.Metrics.EmptyCompletion.Add(1)
 				slog.Warn("provider produced no output within the token budget", "request_id", id,
@@ -1053,6 +1054,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// path: a stream that broke partway was still billed for what it
 			// produced, and that is exactly the request someone asks about.
 			event.recordUsage(streamed.usage)
+			event.servedBy(streamed.model)
 			s.circuits[route.Provider].result(err != nil)
 			if err != nil {
 				// Not 502. The error frame stream() just wrote committed HTTP
@@ -1100,6 +1102,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		// one provider and answered by another reported only the second. Now it
 		// lands on this attempt and Usage is their sum.
 		event.recordUsage(usageOf(n))
+		// Beside the usage and for the same reason: an answer rejected below was
+		// still produced by a particular model, and that is the attempt someone
+		// asks about.
+		event.servedBy(n.Model)
 		s.circuits[route.Provider].result(e != nil)
 		if e != nil {
 			idemSettled = s.settleUnknown(idemKey, hashBody(b))
@@ -1216,6 +1222,9 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 		}
 		if u := usageOf(n); u.Input != 0 || u.Output != 0 {
 			out.usage = u
+		}
+		if n.Model != "" && out != nil {
+			out.model = n.Model
 		}
 		if finished && n.Text != "" {
 			return errors.New("text after finish")
@@ -1569,6 +1578,10 @@ type streamResult struct {
 	// carries any is taken as the running truth, so the last one wins and a
 	// stream cut short still reports whatever had been stated by then.
 	usage tokenUsage
+	// model is the served model as the last frame stating one had it. OpenAI
+	// repeats it on every chunk and Anthropic states it once, in message_start,
+	// so a frame without it must not clear it.
+	model string
 }
 
 // settleUnknown marks a key ambiguous. Deliberately sticky: releasing it would

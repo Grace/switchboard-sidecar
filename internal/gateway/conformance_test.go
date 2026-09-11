@@ -134,7 +134,10 @@ func TestSpansAreConformantAccordingToInterlingua(t *testing.T) {
 	// usage, and a cached Anthropic call, which is the only one that fills the
 	// cache attributes.
 	events := []Event{
+		// With a served model that differs from the one sent, so interlingua
+		// judges gen_ai.response.model as well as gen_ai.request.model.
 		{TraceID: "t", SpanID: "s", Provider: "openai", Model: "gpt-5-nano", Status: 200,
+			Tries: []attemptRecord{{Provider: "openai", Model: "gpt-5-nano", ResponseModel: "gpt-5-nano-2025-08-07"}},
 			Start: 1, End: 2, Attempts: 1, Usage: tokenUsage{Input: 30, Output: 12, Reasoning: 8}},
 		{TraceID: "t", SpanID: "s", Provider: "anthropic", Model: "claude-haiku-4-5", Status: 200,
 			Start: 1, End: 2, Attempts: 1, Usage: tokenUsage{Input: 100050, Output: 7, CacheRead: 100000}},

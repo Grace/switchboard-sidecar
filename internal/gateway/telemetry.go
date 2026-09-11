@@ -660,6 +660,13 @@ func (e Event) wire() Event {
 	if e.Requested != "" && e.Requested != e.Model {
 		ext["requested_model"] = e.Requested
 	}
+	// What served the attempt that ended the request, when the provider said --
+	// the same attempt ext.model describes. Separate from model because the two
+	// differ in normal operation (an alias and its dated snapshot), and the
+	// difference changing is the event worth finding.
+	if tr := e.try(); tr != nil && tr.ResponseModel != "" {
+		ext["response_model"] = tr.ResponseModel
+	}
 	if e.Fault != "" {
 		ext["fault"] = e.Fault
 	}
@@ -695,6 +702,9 @@ func (e Event) wire() Event {
 			}
 			if t.Fault != "" {
 				m["fault"] = t.Fault
+			}
+			if t.ResponseModel != "" {
+				m["response_model"] = t.ResponseModel
 			}
 			for _, a := range t.Usage.attrs() {
 				m[a.key] = a.value
@@ -1413,11 +1423,15 @@ type attemptRecord struct {
 	Seq      int // 1-based, and equal to Event.Attempts at the time
 	Provider string
 	Model    string
-	Status   int // the UPSTREAM status; 0 means the call never returned one
-	Fault    string
-	Start    int64
-	End      int64
-	Usage    tokenUsage
+	// ResponseModel is what the provider said served this attempt, which Model --
+	// what was sent -- cannot tell you. Empty when the provider did not say. See
+	// normalized.Model.
+	ResponseModel string
+	Status        int // the UPSTREAM status; 0 means the call never returned one
+	Fault         string
+	Start         int64
+	End           int64
+	Usage         tokenUsage
 }
 
 // step is one counter across attempts and skips, so the two can be interleaved
@@ -1470,6 +1484,15 @@ func (e *Event) recordUsage(u tokenUsage) {
 		return
 	}
 	e.Usage = u
+}
+
+// servedBy records the model the provider reported for the attempt in progress.
+// An empty model is ignored rather than stored, so a provider that did not say
+// leaves the field empty instead of erasing what an earlier call to this stated.
+func (e *Event) servedBy(model string) {
+	if t := e.try(); t != nil && model != "" {
+		t.ResponseModel = model
+	}
 }
 
 // endTry stamps the outcome of the attempt in progress. Safe to call more than
@@ -1593,6 +1616,13 @@ func (t *Telemetry) spanOf(e Event) map[string]any {
 	}
 	if e.Model != "" {
 		attrs = append(attrs, map[string]any{"key": "gen_ai.request.model", "value": map[string]any{"stringValue": e.Model}})
+	}
+	// gen_ai.response.model, only where the provider stated one. Never the
+	// request model standing in for it: a copy reports the continuity this
+	// attribute exists to check, and a provider repointing an alias at a new
+	// snapshot would then change nothing on the span. Bedrock never states one.
+	if tr := e.try(); tr != nil && tr.ResponseModel != "" {
+		attrs = append(attrs, map[string]any{"key": "gen_ai.response.model", "value": map[string]any{"stringValue": tr.ResponseModel}})
 	}
 	if e.Fault != "" {
 		attrs = append(attrs, map[string]any{"key": "switchboard.fault", "value": map[string]any{"stringValue": e.Fault}})

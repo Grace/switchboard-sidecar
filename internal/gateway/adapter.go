@@ -247,6 +247,16 @@ type normalized struct {
 	// metric rather than an error: the request itself is fine, but a provider
 	// changing how it accounts for tokens must not silently drift revenue.
 	UsageMismatch bool
+	// Model is the model the provider says produced this response, which is not
+	// always the model that was asked for: OpenAI answers a request for an alias
+	// with the dated snapshot that served it, and Gemini reports a modelVersion.
+	// When a provider repoints an alias at a new snapshot this is the only field
+	// that changes. Latency, token counts and empty completions can all shift
+	// with it, and without it nothing lines up with the cause.
+	//
+	// Empty when the provider did not say. Never defaulted to the requested
+	// model: a copy would report exactly the continuity this exists to check.
+	Model string
 }
 
 // usageOf lifts the token counts out of a normalized response and into the
@@ -276,9 +286,18 @@ func finish(s string) (string, error) {
 }
 
 type wire struct {
-	Type    string          `json:"type"`
-	Error   json.RawMessage `json:"error"`
-	Choices []struct {
+	Type  string          `json:"type"`
+	Error json.RawMessage `json:"error"`
+	// The served model, in three places. Top-level model on an OpenAI response,
+	// on every OpenAI stream chunk, and on Anthropic's non-streaming response;
+	// Gemini calls it modelVersion; Anthropic's stream states it once, inside
+	// message_start's message object. Message is left raw and decoded only for
+	// that event, so a body carrying some other top-level "message" -- a string,
+	// say -- is not turned into a decode failure by a field this adds.
+	Model        string          `json:"model"`
+	ModelVersion string          `json:"modelVersion"`
+	Message      json.RawMessage `json:"message"`
+	Choices      []struct {
 		Index   int `json:"index"`
 		Message struct {
 			Content   *string         `json:"content"`
@@ -386,6 +405,7 @@ func normalize(provider string, b []byte, stream bool) (normalized, bool, error)
 		n.Input = w.Usage.Prompt
 		n.Output = w.Usage.Completion
 		n.Reasoning = w.Usage.Details.Reasoning
+		n.Model = w.Model
 		if len(w.Choices) > 1 {
 			return n, false, errors.New("multiple choices unsupported")
 		}
@@ -428,6 +448,9 @@ func normalize(provider string, b []byte, stream bool) (normalized, bool, error)
 		// that reports a cache split today, so these stay zero elsewhere, which
 		// is the correct value rather than a missing one.
 		n.CacheRead, n.CacheWrite = w.Usage.CacheRead, w.Usage.CacheCreation
+		// Top-level on the complete response. A stream carries it only in
+		// message_start, handled below.
+		n.Model = w.Model
 		if stream {
 			switch w.Type {
 			case "content_block_start":
@@ -450,7 +473,14 @@ func normalize(provider string, b []byte, stream bool) (normalized, bool, error)
 				}
 			case "message_stop":
 				done = true
-			case "message_start", "content_block_stop", "ping":
+			case "message_start":
+				var m struct {
+					Model string `json:"model"`
+				}
+				if json.Unmarshal(w.Message, &m) == nil {
+					n.Model = m.Model
+				}
+			case "content_block_stop", "ping":
 			default:
 				return n, false, errors.New("unknown stream event")
 			}
@@ -473,6 +503,9 @@ func normalize(provider string, b []byte, stream bool) (normalized, bool, error)
 		// Thinking tokens are billed as output, so they must be counted as output.
 		n.Output = w.UsageMetadata.Output + w.UsageMetadata.Thoughts
 		n.Reasoning = w.UsageMetadata.Thoughts
+		// Before the prompt-feedback return below: a blocked prompt was still
+		// refused by a particular model.
+		n.Model = w.ModelVersion
 		// The provider also reports a total. When it disagrees with the parts,
 		// this gateway is billing on an accounting model the provider no longer
 		// uses, so say so rather than quietly trusting the sum.

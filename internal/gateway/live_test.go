@@ -174,7 +174,12 @@ func TestLiveNonStreaming(t *testing.T) {
 				// absent. Worth surfacing because billing would depend on it.
 				t.Logf("%s: no token usage reported", p.name)
 			}
-			t.Logf("%s: text=%q finish=%s in=%d out=%d", p.name, n.Text, n.Finish, n.Input, n.Output)
+			// Bedrock's Converse response names no model; every other provider does,
+			// and gen_ai.response.model is only as good as this.
+			if n.Model == "" && p.adapter() != "bedrock" {
+				t.Errorf("%s: a real response named no served model", p.name)
+			}
+			t.Logf("%s: text=%q finish=%s in=%d out=%d served=%q", p.name, n.Text, n.Finish, n.Input, n.Output, n.Model)
 		})
 	}
 }
@@ -200,6 +205,7 @@ func TestLiveStreaming(t *testing.T) {
 			}
 
 			var text strings.Builder
+			var served string
 			var finish string
 			frames, done := 0, false
 			sc := bufio.NewScanner(res.Body)
@@ -221,6 +227,9 @@ func TestLiveStreaming(t *testing.T) {
 						p.name, err, truncate([]byte(payload)))
 				}
 				text.WriteString(n.Text)
+				if n.Model != "" {
+					served = n.Model
+				}
 				if n.Finish != "" {
 					finish = n.Finish
 				}
@@ -243,7 +252,12 @@ func TestLiveStreaming(t *testing.T) {
 			if finish == "" {
 				t.Errorf("%s: stream carried no finish reason", p.name)
 			}
-			t.Logf("%s: %d frames, finish=%s, text=%q", p.name, frames, finish, text.String())
+			// Settles whether Gemini states modelVersion on stream chunks, and that
+			// Anthropic's message_start reaches normalize as a data frame.
+			if served == "" && p.adapter() != "bedrock" {
+				t.Errorf("%s: no stream frame named a served model", p.name)
+			}
+			t.Logf("%s: %d frames, finish=%s, text=%q, served=%q", p.name, frames, finish, text.String(), served)
 		})
 	}
 }

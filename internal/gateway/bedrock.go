@@ -120,6 +120,11 @@ type bedrockWire struct {
 		Text string `json:"text"`
 	} `json:"delta"`
 	ContentBlockIndex *int `json:"contentBlockIndex"`
+	// No model field, and not an omission. The Converse response names none: its
+	// members are output, stopReason, usage, metrics, trace, performanceConfig,
+	// serviceTier and additionalModelResponseFields. A Bedrock attempt therefore
+	// never has a served model, and gen_ai.response.model is absent from its span
+	// rather than filled in with the model that was requested. See docs/GAPS.md.
 }
 
 // bedrockFinish maps Converse stopReason onto the gateway's vocabulary. Values
