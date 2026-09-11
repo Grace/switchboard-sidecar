@@ -196,7 +196,15 @@ const SKIP = {
 /**
  * Parse X-Switchboard-Route into attempts.
  *
- *   openai/gpt-4o-mini:200 empty_completion, anthropic/claude-sonnet-4:200
+ *   openai/gpt-4o-mini=gpt-4o-mini-2024-07-18:200 empty_completion, anthropic/claude-sonnet-4=?:200
+ *
+ * "=<model>" after a model is the model the provider said served the attempt,
+ * when that differs from the one sent; "=?" means the provider did not say.
+ *
+ * Parsed from the right. The status is the last ":" followed by a number or
+ * "skipped", because a model can itself contain ":" -- Bedrock's ids do -- and a
+ * pattern that stopped at the first one read those as unparseable. The served
+ * model is split off at the last "=" for the same reason.
  *
  * Deliberately tolerant: an unparseable entry is shown raw rather than dropped,
  * because silently losing an attempt would understate what a request cost.
@@ -205,16 +213,32 @@ function parseRoute(header) {
   if (!header) return []
   return header.split(',').map((part) => {
     const raw = part.trim()
-    const m = raw.match(/^([^/:]+)(?:\/([^:]+))?:(skipped|[0-9-]+)(?:\s+(.*))?$/)
-    if (!m) return { raw, provider: raw, model: '', status: '', fault: '', skipped: false }
-    const skipped = m[3] === 'skipped'
+    const m = raw.match(/^(.*):(skipped|[0-9-]+)(?:\s+(.*))?$/)
+    if (!m) return { raw, provider: raw, model: '', served: '', status: '', fault: '', skipped: false }
+    const skipped = m[2] === 'skipped'
+    const slash = m[1].indexOf('/')
+    const provider = slash < 0 ? m[1] : m[1].slice(0, slash)
+    let model = slash < 0 ? '' : m[1].slice(slash + 1)
+    let served = ''
+    const eq = model.lastIndexOf('=')
+    if (eq >= 0) {
+      served = model.slice(eq + 1)
+      model = model.slice(0, eq)
+    }
     return {
-      raw, provider: m[1], model: m[2] || '',
-      status: skipped ? '' : m[3],
-      fault: skipped ? '' : (m[4] || ''),
-      skipped, reason: skipped ? (m[4] || '') : '',
+      raw, provider, model, served,
+      status: skipped ? '' : m[2],
+      fault: skipped ? '' : (m[3] || ''),
+      skipped, reason: skipped ? (m[3] || '') : '',
     }
   })
+}
+
+/** The line a hop card shows about the model that served it, if any. */
+function servedLine(a) {
+  if (a.served === '?') return `<div class="cost">the provider did not say which model served this</div>`
+  if (a.served) return `<div class="cost">served as ${esc(a.served)}, not the model that was sent</div>`
+  return ''
 }
 
 function renderChain(steps) {
@@ -236,6 +260,7 @@ function renderChain(steps) {
         <div class="who">${esc(a.provider)}${a.model ? ' / ' + esc(a.model) : ''}</div>
         <div class="what">${a.status === '-' ? 'no response' : 'HTTP ' + esc(a.status)}${
           last ? ' — answered this request' : ''}</div>
+        ${servedLine(a)}
       </div>`))
     }
 
