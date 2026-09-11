@@ -345,3 +345,69 @@ def test_savings_window_is_bounded_and_role_gated(setup):
     assert client.get("/v1/savings?hours=0", headers=auth(tokens, role="viewer")).json()["window_hours"] == 1
     # agent writes telemetry; it does not get to read the spend aggregate.
     assert client.get("/v1/savings", headers=auth(tokens, role="agent")).status_code == 403
+
+
+def test_unobserved_tokens_are_null_not_zero(setup):
+    """A request that never reached a provider has no token counts, not zeros.
+
+    /v1/savings leaves these NULL -- sum() over no rows -- and /v1/requests used
+    to coalesce them to 0, so the same fact meant different things depending on
+    which endpoint you read it from. This project's rule is that a blank is
+    silence and never a zero, and here the difference is arithmetic rather than
+    presentation: average the input tokens across these rows with refused
+    requests contributing 0 and the answer is wrong, because "tokens per
+    request" is a statement about requests that reached a provider.
+
+    A provider that genuinely reports 0 is a separate case and must still read
+    as 0, so both are asserted.
+    """
+    client, tokens, _ = setup
+
+    refused = secrets.token_hex(16)
+    charged = secrets.token_hex(16)
+    zeroed = secrets.token_hex(16)
+    events = [
+        # Refused before routing: no provider, and ext carries no usage at all.
+        {**_usage_event(refused, "", 0, {"requested_model": "a-model-no-policy-offers"}),
+         "status": 400},
+        _usage_event(charged, "openai", 1, {
+            "model": "gpt-4o-mini",
+            "gen_ai.usage.input_tokens": 41,
+            "gen_ai.usage.output_tokens": 12,
+        }),
+        # Asked, answered, and charged nothing. Observed zero, not absence.
+        _usage_event(zeroed, "openai", 1, {
+            "model": "gpt-4o-mini",
+            "gen_ai.usage.input_tokens": 0,
+            "gen_ai.usage.output_tokens": 0,
+        }),
+    ]
+    r = client.post("/v1/telemetry/batch", json={"events": events},
+                    headers=auth(tokens, role="agent"))
+    assert r.status_code == 200, r.text
+
+    r = client.get("/v1/requests?hours=1&limit=500", headers=auth(tokens, role="viewer"))
+    assert r.status_code == 200, r.text
+
+    # Matched on the distinguishing columns rather than request_id, which the
+    # projection does not carry. The property under test is about the values.
+    body = r.json()["rows"]
+    refused_rows = [x for x in body if x["provider"] == "" and x["status"] == 400]
+    assert refused_rows, "the refused request is not in the window"
+    for x in refused_rows:
+        assert x["input_tokens"] is None, (
+            "a request that never reached a provider reported %r input tokens; "
+            "0 says a provider was asked and charged nothing, which is a "
+            "different claim from having no count at all" % x["input_tokens"])
+        assert x["output_tokens"] is None
+        assert x["cache_read"] is None
+
+    charged_rows = [x for x in body if x.get("input_tokens") == 41]
+    assert charged_rows, "the charged request is missing or its tokens changed"
+
+    zero_rows = [x for x in body
+                 if x["provider"] == "openai" and x["input_tokens"] == 0]
+    assert zero_rows, (
+        "a provider that reported 0 tokens must still read as 0. If this fails "
+        "alongside the assertion above, absence and observed-zero have been "
+        "collapsed in the other direction")

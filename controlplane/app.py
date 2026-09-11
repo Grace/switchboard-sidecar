@@ -415,9 +415,21 @@ def create_app(pool=None, seed=None, key_id=None):
               (event->>'attempts')::int                                     AS attempts,
               ((event->>'end_ns')::bigint - (event->>'start_ns')::bigint)/1000000
                                                                             AS duration_ms,
-              coalesce((event->'ext'->>'gen_ai.usage.input_tokens')::bigint, 0)  AS input_tokens,
-              coalesce((event->'ext'->>'gen_ai.usage.output_tokens')::bigint, 0) AS output_tokens,
-              coalesce((event->'ext'->>'gen_ai.usage.cache_read.input_tokens')::bigint, 0)
+              -- Not coalesced to 0, deliberately. A request refused before
+              -- routing carries no token counts at all, and 0 is a different
+              -- claim from absent: it says a provider was asked and charged
+              -- nothing. /v1/savings already leaves these NULL, via sum() over
+              -- no rows, so coalescing here gave the same data two meanings
+              -- depending on which endpoint you read it from.
+              --
+              -- It is not only a naming quibble. Average the input tokens over
+              -- these rows with unrouted requests contributing 0 and the answer
+              -- is wrong; with NULL they are excluded, which is what an average
+              -- of "tokens per request that reached a provider" means. The
+              -- page's own rule is that a blank is silence, never a zero.
+              (event->'ext'->>'gen_ai.usage.input_tokens')::bigint       AS input_tokens,
+              (event->'ext'->>'gen_ai.usage.output_tokens')::bigint      AS output_tokens,
+              (event->'ext'->>'gen_ai.usage.cache_read.input_tokens')::bigint
                                                                             AS cache_read,
               coalesce(event->'ext'->>'fault','')                           AS fault,
               coalesce(event->'ext'->>'requested_model','')                  AS requested_model
