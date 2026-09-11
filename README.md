@@ -95,5 +95,5 @@ AWS-published.
 
 Contributions are not currently accepted. When that changes,
 [CONTRIBUTING.md](CONTRIBUTING.md) sets the terms: sign-off under the
-[DCO](DCO), plus a grant permitting relicensing and use in Switchboard
-Recordkeeper, which is closed source. Contributors keep their copyright.
+[DCO](DCO), plus a grant permitting relicensing and use in the other
+Switchboard repositories. Contributors keep their copyright.

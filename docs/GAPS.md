@@ -1157,8 +1157,8 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
 
     What supplies the inbound license is Apache 2.0 section 5. What permits
     relicensing a contribution under different or proprietary terms -- the thing
-    a future `enterprise/` carve-out and Switchboard Recordkeeper actually depend
-    on -- is the separate **Grant** section of `CONTRIBUTING.md`, which is
+    a future `enterprise/` carve-out would actually depend on -- is the separate
+    **Grant** section of `CONTRIBUTING.md`, which is
     sublicensable and transferable and says so plainly. That architecture is
     correct; only the commit message's account of it is not.
 

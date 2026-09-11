@@ -45,8 +45,13 @@ That last clause is doing real work and is stated plainly rather than buried:
 - Switchboard Sidecar is Apache 2.0 today. This grant permits relicensing it
   later, including under different terms — it has already carried the project
   through MIT, the Elastic License 2.0 and back to Apache.
-- **Switchboard Recordkeeper is proprietary and closed.** Your contribution may
-  be used there, in a product whose source is not published.
+- Your contribution may be used in the other Switchboard repositories, which is
+  what the grant is chiefly for. Every one of them is Apache 2.0 today,
+  including Switchboard Recordkeeper.
+- **Today's licence is not a promise about tomorrow's.** The grant permits
+  relicensing under any terms, and the history above is evidence that it gets
+  exercised. If a future product built on this code were not published, this
+  grant is what would permit that.
 
 If either is unacceptable to you, do not contribute. That is a reasonable
 position and no argument will be made against it.
