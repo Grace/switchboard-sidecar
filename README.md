@@ -38,6 +38,13 @@ literal string `"preferred"`, because the signed policy chooses the model rather
 than the caller. See [local development](docs/LOCAL.md), which also covers going
 from the mock to a real provider without a control plane.
 
+## Who it is for
+
+Four buyer personas, what each is trying to stop happening, and which deployment
+shape each needs: [`docs/USE-CASES.md`](docs/USE-CASES.md). It includes the
+argument for buying rather than building, which is made of specific failures
+found here by measurement rather than of adjectives.
+
 ## What is implemented
 
 - Loopback-only, single-tenant Go data plane; text chat normalization for OpenAI, Anthropic, Gemini and Amazon Bedrock. **All four stream.** Bedrock's AWS event-stream framing is translated to server-sent events at the provider boundary by `bedrockSSE`, so the generation deadline, finish tracking, empty-completion detection and the refusal to replay after acceptance apply to it identically rather than gaining an exception.
