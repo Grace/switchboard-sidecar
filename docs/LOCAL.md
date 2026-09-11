@@ -303,6 +303,33 @@ Both the gateway and this tooling reach any OTLP backend. Grafana Cloud takes Ba
 takes `dd-api-key`, a local collector takes no header at all; only `controlplane/honeycomb.py` knows what
 Honeycomb is.
 
+## Showing a served-model change
+
+`make dev-traffic` drives real requests through the gateway under a sequence of signed policies, so
+`/dashboard` has more than one route in it. Its last phase is the one routing cannot explain: the
+policy stays fixed and, midway, the mock provider starts answering openai as
+`gpt-4o-mini-simulated-snapshot`. Same route, same provider, and a different model saying it served
+the request, which is what a provider moving an alias to a new snapshot looks like.
+
+Nothing is written behind the telemetry's back. The mock really returns a different model, through
+`POST /control`, which exists only because `MOCK_CONTROL=1` is set on the `mockprovider` service. The
+change is labelled before it is made:
+
+- an annotation on the control plane, through `POST /v1/annotations`, which exists only with
+  `SWITCHBOARD_DEV=1`. This is what `/dashboard/drift` reads to mark the change **simulated**.
+- a Honeycomb marker of type `simulated`, when `HONEYCOMB_CONFIG_KEY` is exported in the shell you run
+  it from. The key then also needs the Markers permission. `dev-traffic.sh` passes the variable by
+  name, so it never enters `.dev/env`.
+
+If the annotation cannot be written, the mock is not switched, so no chart shows an injected change
+as an observed one. The phase then checks its own work -- the route header before and after, and
+`/v1/series` showing the new model under a single policy version -- and exits non-zero if either is
+wrong.
+
+Afterwards `/dashboard/drift` shows the change. With OTLP export on, re-run
+`python -m controlplane.honeycomb` once the `switchboard-gateway` dataset has a `gen_ai.response.model`
+column, and the board gains the served-model panels; before that the tool lists them as left off.
+
 ## Verifying against real providers
 
 The local stack runs against a mock, which is what makes it free and

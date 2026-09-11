@@ -1,4 +1,4 @@
-.PHONY: fmt check test build dev-up dev-smoke dev-down dev-logs
+.PHONY: fmt check test build dev-up dev-smoke dev-traffic dev-down dev-logs
 
 # `make check` is the go job from .github/workflows/ci.yml, runnable before a
 # push. It did not exist, which is how two gofmt nits sat on main for eight
@@ -29,6 +29,10 @@ dev-up:
 	./scripts/dev-up.sh
 dev-smoke:
 	./scripts/dev-smoke.sh
+# Real traffic under several signed policies, ending with a simulated
+# served-model change. Needs the stack from dev-up; see docs/LOCAL.md.
+dev-traffic:
+	./scripts/dev-traffic.sh
 dev-down:
 	./scripts/dev-down.sh
 # Sources .dev/env for the same reason dev-up.sh does: compose interpolates
