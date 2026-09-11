@@ -287,6 +287,81 @@ def create_app(pool=None, seed=None, key_id=None):
     # predates batching keeps working and a gateway that postdates an old control
     # plane falls back to it on 404. Either component can be deployed first, which
     # is what makes this safe to ship independently.
+    @app.get("/v1/savings")
+    def savings(hours: int = 24, s=Depends(session, scope="function")):
+        """What routing cost and what it avoided, over a window.
+
+        Tokens, never money. This service has no price table and inventing one
+        would put a fabricated number in front of whoever reads it; rates are per
+        contract and change. The caller multiplies by their own rate, which is
+        also why the figures below are separated by kind rather than summed.
+
+        The viewer role can read this. It is the same set that can read
+        /v1/telemetry, because this is that data aggregated and nothing more --
+        a reader who can see the events can already compute this by hand.
+        """
+        db, p = s
+        require(p, "admin", "publisher", "viewer")
+        # Bounded, because this aggregates a table that grows with traffic and an
+        # unbounded window is a slow query somebody will eventually issue.
+        hours = max(1, min(hours, 24 * 31))
+
+        # One pass. Every figure comes from the same rows, so they cannot
+        # disagree about which requests were in the window.
+        rows = db.execute(
+            """
+            SELECT
+              coalesce(event->>'provider','')                              AS provider,
+              coalesce(event->'ext'->>'model','')                          AS model,
+              count(*)                                                     AS requests,
+              sum((event->'ext'->>'gen_ai.usage.input_tokens')::bigint)    AS input_tokens,
+              sum((event->'ext'->>'gen_ai.usage.output_tokens')::bigint)   AS output_tokens,
+              sum((event->'ext'->>'gen_ai.usage.cache_read.input_tokens')::bigint)  AS cache_read,
+              sum((event->'ext'->>'gen_ai.usage.cache_write.input_tokens')::bigint) AS cache_write,
+              count(*) FILTER (WHERE (event->>'attempts')::int > 1)        AS failed_over,
+              count(*) FILTER (WHERE event->'ext'->>'idempotent_replay' = 'true') AS replays,
+              count(*) FILTER (WHERE event->'ext' ? 'budget_skipped')      AS budget_skipped
+            FROM telemetry
+            WHERE received_at > now() - make_interval(hours => %s)
+            GROUP BY 1, 2
+            ORDER BY coalesce(sum((event->'ext'->>'gen_ai.usage.input_tokens')::bigint), 0) DESC
+            """,
+            (hours,)).fetchall()
+        routes = [dict(r) for r in rows]
+
+        fault_rows = db.execute(
+            """SELECT coalesce(event->'ext'->>'fault','') AS fault, count(*) AS n
+                 FROM telemetry
+                WHERE received_at > now() - make_interval(hours => %s)
+                  AND event->'ext' ? 'fault'
+                GROUP BY 1""",
+            (hours,)).fetchall()
+        faults = {r["fault"]: r["n"] for r in fault_rows}
+
+        total = lambda k: sum(r[k] or 0 for r in routes)
+        return {
+            "window_hours": hours,
+            # Stated so a reader knows whether an empty page means "nothing
+            # happened" or "nothing was sent", which are very different.
+            "requests": total("requests"),
+            "routes": routes,
+            "faults": faults,
+            "tokens": {
+                "input": total("input_tokens"),
+                "output": total("output_tokens"),
+                # Measured, not estimated: these were billed at the provider's
+                # cache rate rather than the input rate, so this is the one
+                # saving here that is an observation.
+                "cache_read": total("cache_read"),
+                "cache_write": total("cache_write"),
+            },
+            "avoided": {
+                "replayed_requests": total("replays"),
+                "budget_skipped_requests": total("budget_skipped"),
+            },
+            "failed_over_requests": total("failed_over"),
+        }
+
     @app.post("/v1/health")
     def health_sync(body: HealthSync, s=Depends(session, scope="function")):
         """Exchange circuit state with the rest of this tenant's fleet.

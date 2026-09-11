@@ -552,6 +552,22 @@ type Event struct {
 	// decision nothing type-checks.
 	Model string `json:"-"`
 	Fault string `json:"-"`
+	// Replayed records that this response came from the idempotency store rather
+	// than from a provider. The response header already says so to the caller,
+	// for the reason replay() states: without it a replay and a fresh generation
+	// are indistinguishable and a retry looks like it cost money. The control
+	// plane had exactly the same blindness -- a replay emits an event with
+	// attempts 0, which is also what a 401 and a policy refusal look like -- so
+	// the saving could not be counted anywhere the money is actually reviewed.
+	Replayed bool `json:"-"`
+	// BudgetSkipped names the routes passed over because that model was already
+	// seen returning nothing at this caller's token budget. Each one is a
+	// provider call not made and not billed, and like Replayed it was a
+	// process-local counter that never reached anyone reviewing spend.
+	//
+	// The routes rather than a count, because "which model is being skipped and
+	// how often" is the question that leads to a policy change.
+	BudgetSkipped []string `json:"-"`
 	// StreamFailed records that a streaming response broke after the status line
 	// was already on the wire.
 	//
@@ -602,6 +618,12 @@ func (e Event) wire() Event {
 	}
 	if e.StreamFailed {
 		ext["stream_failed"] = true
+	}
+	if e.Replayed {
+		ext["idempotent_replay"] = true
+	}
+	if len(e.BudgetSkipped) > 0 {
+		ext["budget_skipped"] = e.BudgetSkipped
 	}
 	for _, a := range e.Usage.attrs() {
 		ext[a.key] = a.value

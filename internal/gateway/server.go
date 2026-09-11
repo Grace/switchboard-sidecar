@@ -723,6 +723,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// succeeding at or below it. Trying anyway spends the caller's money
 			// to learn what is already known.
 			s.Metrics.BudgetSkip.Add(1)
+			event.BudgetSkipped = append(event.BudgetSkipped, route.Provider+":"+route.Model)
 			continue
 		}
 		if event.Attempts >= s.C.MaxAttempts {
@@ -1511,6 +1512,11 @@ func (s *Server) settleUnknown(key string, bodyHash string) bool {
 // replay serves a stored outcome without contacting any provider.
 func (s *Server) replay(w http.ResponseWriter, e *idemEntry, id string, created int64, event *Event) {
 	event.Status = e.Status
+	// The same fact the header below carries, on the event, so that whoever is
+	// reviewing spend can tell a generation that was not paid for from one that
+	// was. Both are needed: the header answers the caller, the event answers the
+	// control plane.
+	event.Replayed = true
 	// Named so a caller can tell a replay from a fresh generation; without it the
 	// two are indistinguishable and a retry looks like it cost money.
 	w.Header().Set("X-Switchboard-Replayed", "true")

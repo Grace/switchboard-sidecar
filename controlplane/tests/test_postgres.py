@@ -246,3 +246,102 @@ def test_policy_schema_is_recorded_for_negotiation(setup):
                          " ORDER BY version DESC LIMIT 1").fetchone()
     # dict_row: the pool returns mappings, not tuples.
     assert row["schema"] == 1
+
+
+def _dig(doc, path):
+    for k in path:
+        doc = doc[k]
+    return doc or 0
+
+
+def _usage_event(rid, provider, attempts, ext):
+    """One telemetry event in the shape the gateway actually sends."""
+    now = time.time_ns()
+    return {"id": secrets.token_hex(16), "request_id": rid, "trace_id": secrets.token_hex(16),
+            "span_id": secrets.token_hex(8), "provider": provider, "status": 200,
+            "attempts": attempts, "start_ns": now, "end_ns": now + 1, "ext": ext}
+
+
+def test_savings_totals_are_the_arithmetic_they_claim(setup):
+    """The arithmetic is the product, so it is asserted rather than eyeballed.
+
+    A dashboard that quietly sums the wrong column still draws a confident
+    number, and the person reading it has no way to tell.
+    """
+    client, tokens, _ = setup
+    events = [
+        _usage_event(secrets.token_hex(16), "anthropic", 1, {
+            "model": "claude-haiku-4-5",
+            "gen_ai.usage.input_tokens": 1000,
+            "gen_ai.usage.output_tokens": 100,
+            "gen_ai.usage.cache_read.input_tokens": 800,
+        }),
+        _usage_event(secrets.token_hex(16), "anthropic", 2, {
+            "model": "claude-haiku-4-5",
+            "gen_ai.usage.input_tokens": 500,
+            "gen_ai.usage.output_tokens": 50,
+            "fault": "rate_limit",
+        }),
+        # A replay: served from the store, so no provider was paid.
+        _usage_event(secrets.token_hex(16), "", 0, {"idempotent_replay": True}),
+        # A request that passed over a route it would otherwise have paid for.
+        _usage_event(secrets.token_hex(16), "openai", 1, {
+            "model": "gpt-5-nano",
+            "gen_ai.usage.input_tokens": 200,
+            "gen_ai.usage.output_tokens": 20,
+            "budget_skipped": ["openai:gpt-5-reasoning"],
+        }),
+    ]
+    # Deltas, not totals. Every test in this module shares one database and
+    # several of them post telemetry, so an absolute assertion here would be
+    # asserting on test execution order.
+    def read():
+        return client.get("/v1/savings?hours=1", headers=auth(tokens, role="viewer")).json()
+
+    before = read()
+    r = client.post("/v1/telemetry/batch", json={"events": events},
+                    headers=auth(tokens, role="agent"))
+    assert r.status_code == 200, r.text
+    got = read()
+
+    d = lambda path: _dig(got, path) - _dig(before, path)
+    assert d(("tokens", "input")) == 1700, (before, got)       # 1000 + 500 + 200
+    assert d(("tokens", "output")) == 170, (before, got)       # 100 + 50 + 20
+    assert d(("tokens", "cache_read")) == 800, (before, got)   # measured, not estimated
+    assert d(("avoided", "replayed_requests")) == 1, (before, got)
+    assert d(("avoided", "budget_skipped_requests")) == 1, (before, got)
+    assert d(("failed_over_requests",)) == 1, (before, got)    # the one with attempts 2
+    assert got["faults"].get("rate_limit", 0) - before["faults"].get("rate_limit", 0) == 1, (before, got)
+    # Never money: this service has no price table and must not invent one.
+    assert "cost" not in got and "usd" not in str(got).lower(), got
+
+
+def test_savings_is_tenant_isolated(setup):
+    """An aggregate endpoint is exactly where a missing tenant predicate hides.
+
+    A per-row read that leaks is obvious in the response. A sum that includes
+    another tenant's traffic looks like a plausible number.
+    """
+    client, tokens, _ = setup
+    r = client.post("/v1/telemetry/batch", json={"events": [
+        _usage_event(secrets.token_hex(16), "gemini", 1, {
+            "model": "gemini-3.6-flash", "gen_ai.usage.input_tokens": 999_999,
+            "gen_ai.usage.output_tokens": 1})]},
+        headers=auth(tokens, tenant="tenant-b", role="agent"))
+    assert r.status_code == 200, r.text
+
+    a = client.get("/v1/savings?hours=1", headers=auth(tokens, tenant="tenant-a", role="viewer")).json()
+    assert a["tokens"]["input"] != 999_999 and a["tokens"]["input"] < 999_999, a
+    assert all(r["provider"] != "gemini" for r in a["routes"]), a
+
+    b = client.get("/v1/savings?hours=1", headers=auth(tokens, tenant="tenant-b", role="viewer")).json()
+    assert b["tokens"]["input"] == 999_999, b
+
+
+def test_savings_window_is_bounded_and_role_gated(setup):
+    client, tokens, _ = setup
+    # An unbounded window is a slow query somebody will eventually issue.
+    assert client.get("/v1/savings?hours=99999", headers=auth(tokens, role="viewer")).json()["window_hours"] == 24 * 31
+    assert client.get("/v1/savings?hours=0", headers=auth(tokens, role="viewer")).json()["window_hours"] == 1
+    # agent writes telemetry; it does not get to read the spend aggregate.
+    assert client.get("/v1/savings", headers=auth(tokens, role="agent")).status_code == 403
