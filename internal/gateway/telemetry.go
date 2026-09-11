@@ -591,6 +591,22 @@ type Event struct {
 	// plane through Ext, so an older control plane treats it as data rather than
 	// failing the whole event.
 	Usage tokenUsage `json:"-"`
+	// Tries is the per-attempt detail: one record per upstream call, in the
+	// order they were made.
+	//
+	// Named Tries and not Attempts because Attempts is already the core
+	// schema's count of the same thing, and a slice shadowing it by name would
+	// be misread at every call site.
+	//
+	// It exists because Usage above could not be trusted on a request that
+	// failed over. Each attempt overwrote the last, so a request billed by
+	// OpenAI and then answered by Anthropic reported only Anthropic's tokens --
+	// under-reporting real spend on exactly the number /v1/savings is for. With
+	// a record per attempt, Usage becomes their sum and nothing billed is lost.
+	//
+	// Span-only in the same sense as Model, Fault and Usage: it reaches the
+	// control plane through Ext, so an older one treats it as data.
+	Tries []attemptRecord `json:"-"`
 	// Ext carries everything the core schema does not name. The control plane
 	// validates the core strictly and keeps this verbatim, so a field added to
 	// the gateway reaches an older control plane as data rather than as a
@@ -1287,6 +1303,86 @@ func (t *Telemetry) exportOTLPBatch(ctx context.Context, events []Event) {
 // CacheRead and CacheWrite are parts of Input, not additions to it.
 type tokenUsage struct {
 	Input, Output, Reasoning, CacheRead, CacheWrite int
+}
+
+// add sums two usage records, for rolling per-attempt costs into the total.
+func (u tokenUsage) add(o tokenUsage) tokenUsage {
+	return tokenUsage{
+		Input:      u.Input + o.Input,
+		Output:     u.Output + o.Output,
+		Reasoning:  u.Reasoning + o.Reasoning,
+		CacheRead:  u.CacheRead + o.CacheRead,
+		CacheWrite: u.CacheWrite + o.CacheWrite,
+	}
+}
+
+// attemptRecord is one upstream call.
+//
+// Event.Provider, Event.Model and Event.Status describe only the attempt that
+// ended the request. These describe every attempt, including the ones whose
+// tokens were billed and then discarded because the answer was unusable.
+type attemptRecord struct {
+	SpanID   string
+	Seq      int // 1-based, and equal to Event.Attempts at the time
+	Provider string
+	Model    string
+	Status   int // the UPSTREAM status; 0 means the call never returned one
+	Fault    string
+	Start    int64
+	End      int64
+	Usage    tokenUsage
+}
+
+// beginTry records that an upstream call is about to be made. The span id is
+// minted here rather than at the end because every exit path from the attempt
+// needs something to refer to, including the ones that never get a status.
+func (e *Event) beginTry(provider, model string, start int64, spanID string) {
+	e.Tries = append(e.Tries, attemptRecord{
+		SpanID: spanID, Seq: len(e.Tries) + 1, Provider: provider, Model: model, Start: start,
+	})
+}
+
+// try returns the attempt in progress, or nil if none has begun.
+func (e *Event) try() *attemptRecord {
+	if len(e.Tries) == 0 {
+		return nil
+	}
+	return &e.Tries[len(e.Tries)-1]
+}
+
+// recordUsage attributes what a provider charged to the attempt that incurred
+// it, and keeps Usage as the running total.
+//
+// The assignment this replaces was Usage = usage, whose comment said the cost of
+// an answer that was then rejected still had to be recorded -- correct, and not
+// what the code did, because the next attempt overwrote it.
+func (e *Event) recordUsage(u tokenUsage) {
+	if t := e.try(); t != nil {
+		t.Usage = u
+		total := tokenUsage{}
+		for _, r := range e.Tries {
+			total = total.add(r.Usage)
+		}
+		e.Usage = total
+		return
+	}
+	e.Usage = u
+}
+
+// endTry stamps the outcome of the attempt in progress. Safe to call more than
+// once and safe to call with no attempt open.
+func (e *Event) endTry(status int, fault string, end int64) {
+	t := e.try()
+	if t == nil {
+		return
+	}
+	if status != 0 {
+		t.Status = status
+	}
+	if fault != "" {
+		t.Fault = fault
+	}
+	t.End = end
 }
 
 type usageAttr struct {

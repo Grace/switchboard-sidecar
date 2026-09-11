@@ -754,6 +754,11 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		event.Attempts++
 		event.Provider = route.Provider
 		event.Model = route.Model
+		// One record per upstream call, opened here so that every exit from this
+		// loop body -- and there are many -- has something to attribute a cost
+		// or a fault to. Its span id is minted now because the child span needs
+		// one even on the paths that never get a status back.
+		event.beginTry(route.Provider, route.Model, time.Now().UnixNano(), randomID(8))
 		sent := c
 		if sent.Temperature != nil && s.temps.omit(route.Provider, route.Model) {
 			// Known refuser. Paying the 400 again on every request would be a
@@ -777,6 +782,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Header.Set("X-Request-ID", id)
 		res, e := s.HTTP.Do(req)
+		// Stamped on this attempt as soon as the provider answers, so every exit
+		// from here -- a refusal that fails over, an empty completion that fails
+		// over, or the success that ends the request -- carries the status the
+		// provider actually sent. Without it the per-attempt record has the
+		// provider and not what it said, which is the half a caller needs.
+		if e == nil && res != nil {
+			event.endTry(res.StatusCode, "", time.Now().UnixNano())
+		}
 		if e == nil && res.StatusCode >= 400 && sent.Temperature != nil {
 			// One immediate retry without the field, if the provider said the
 			// field is the problem. Safe, and for a specific reason: a 400 means
@@ -837,6 +850,11 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// one that cost one, and until now they were indistinguishable.
 			f := classify(status, errBody)
 			event.Fault = f.String()
+			// Also on the attempt. event.Fault keeps the last classification,
+			// which is right for the span's summary and wrong for a route
+			// listing: a request that was rate limited and then refused should
+			// say so in that order rather than twice with the second answer.
+			event.endTry(status, f.String(), time.Now().UnixNano())
 			switch f {
 			case faultAccount:
 				s.share(route.Provider, faultAccount)
@@ -986,7 +1004,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// Outside the branch below for the same reason as the non-streaming
 			// path: a stream that broke partway was still billed for what it
 			// produced, and that is exactly the request someone asks about.
-			event.Usage = streamed.usage
+			event.recordUsage(streamed.usage)
 			s.circuits[route.Provider].result(err != nil)
 			if err != nil {
 				// Not 502. The error frame stream() just wrote committed HTTP
@@ -1028,7 +1046,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		// Recorded before the error check below, and before any failover, so the
 		// span for a request that was answered and then rejected as unusable
 		// still says what that answer cost. It was still billed.
-		event.Usage = usageOf(n)
+		//
+		// This said event.Usage = usageOf(n) and did not do what the paragraph
+		// above claims: the next attempt overwrote it, so a request billed by
+		// one provider and answered by another reported only the second. Now it
+		// lands on this attempt and Usage is their sum.
+		event.recordUsage(usageOf(n))
 		s.circuits[route.Provider].result(e != nil)
 		if e != nil {
 			idemSettled = s.settleUnknown(idemKey, hashBody(b))
@@ -1046,6 +1069,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// The provider is healthy, so the circuit was already reset above.
 			// Nothing has been written to the client yet, so failing over does
 			// not violate the no-replay-after-acceptance rule.
+			// Recorded on the attempt, not only counted. This is the one
+			// failover whose cause is invisible in the status: the provider
+			// returned 200 and charged for it, so a route listing showed
+			// "openai:200, anthropic:200" and looked like a request that moved
+			// on for no reason. The reason is that the first answer was empty.
+			event.endTry(res.StatusCode, "empty_completion", time.Now().UnixNano())
 			s.budgets.observe(route.Provider, route.Model, c.MaxTokens, false)
 			empties = append(empties, emptyRoute{route.Provider, route.Model, c.MaxTokens, n.Reasoning})
 			s.Metrics.EmptyCompletion.Add(1)
