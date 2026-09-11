@@ -958,3 +958,105 @@ func TestBrokenStreamRecordsTheSentStatusAndStillCountsAsAnError(t *testing.T) {
 		t.Errorf("span reports a 502 for a request the client saw as 200:\n%s", body)
 	}
 }
+
+// A rate limit is the only fault class that clears on its own, so it is the only
+// one where waiting can beat moving on. This asserts the gate as much as the
+// behaviour: without a stated Retry-After, or with one past the operator's
+// ceiling, the request fails over exactly as it did before.
+func TestRateLimitRetriesTheSameProviderOnlyWhenToldToComeBackSoon(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		retryAfter string
+		ceilingMs  int
+		wantFirst  int64 // calls to the rate-limited provider
+		wantSecond int64 // calls to the fallback
+	}{
+		{"told to wait one second, and allowed to", "1", 2000, 2, 0},
+		{"told to wait longer than the operator allows", "30", 2000, 1, 1},
+		{"told nothing at all", "", 2000, 1, 1},
+		{"retrying disabled, which is the default", "1", 0, 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var first, second atomic.Int64
+			a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Rate limited once; a retry gets a real answer, which is the
+				// point of waiting.
+				if first.Add(1) == 1 {
+					if tc.retryAfter != "" {
+						w.Header().Set("Retry-After", tc.retryAfter)
+					}
+					w.WriteHeader(429)
+					w.Write([]byte(`{"error":{"message":"slow down"}}`))
+					return
+				}
+				w.Write([]byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"waited"},"finish_reason":"stop"}]}`))
+			}))
+			defer a.Close()
+			b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				second.Add(1)
+				w.Write([]byte(`{"content":[{"type":"text","text":"failed over"}],"stop_reason":"end_turn"}`))
+			}))
+			defer b.Close()
+
+			s := testServer(t, map[string]ProviderConfig{
+				"openai":    {URL: a.URL, KeyEnv: "PROVIDER_KEY"},
+				"anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"},
+			})
+			s.C.RateLimitRetryMaxMs = tc.ceilingMs
+
+			w := call(s, chat)
+			if w.Code != 200 {
+				t.Fatalf("status %d: %s", w.Code, w.Body)
+			}
+			if first.Load() != tc.wantFirst || second.Load() != tc.wantSecond {
+				t.Errorf("first provider called %d times and the fallback %d; want %d and %d",
+					first.Load(), second.Load(), tc.wantFirst, tc.wantSecond)
+			}
+			// Counted either way, because it is still a rate limit.
+			if s.Metrics.RateLimited.Load() != 1 {
+				t.Errorf("RateLimited = %d, want 1", s.Metrics.RateLimited.Load())
+			}
+			wantRetry := int64(0)
+			if tc.wantFirst == 2 {
+				wantRetry = 1
+			}
+			if s.Metrics.RateLimitRetry.Load() != wantRetry {
+				t.Errorf("RateLimitRetry = %d, want %d", s.Metrics.RateLimitRetry.Load(), wantRetry)
+			}
+		})
+	}
+}
+
+// The retry happens once. A provider that rate limits every time must not hold
+// the request in a loop against its own Retry-After.
+func TestRateLimitRetryHappensOnlyOncePerRoute(t *testing.T) {
+	var first, second atomic.Int64
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first.Add(1)
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(429)
+		w.Write([]byte(`{"error":{"message":"still slow down"}}`))
+	}))
+	defer a.Close()
+	b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		second.Add(1)
+		w.Write([]byte(`{"content":[{"type":"text","text":"failed over"}],"stop_reason":"end_turn"}`))
+	}))
+	defer b.Close()
+
+	s := testServer(t, map[string]ProviderConfig{
+		"openai":    {URL: a.URL, KeyEnv: "PROVIDER_KEY"},
+		"anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"},
+	})
+	s.C.RateLimitRetryMaxMs = 2000
+
+	if w := call(s, chat); w.Code != 200 {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	if first.Load() != 2 {
+		t.Errorf("rate-limited provider called %d times, want exactly 2 (the try and one retry)", first.Load())
+	}
+	if second.Load() != 1 {
+		t.Errorf("fallback called %d times, want 1; the request must still move on", second.Load())
+	}
+}

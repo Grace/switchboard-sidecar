@@ -593,7 +593,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	// Providers that answered and produced no text, so an exhausted loop can say
 	// which ones and why rather than reporting a generic routing failure.
 	var empties []emptyRoute
-	for i, route := range p.Routes {
+	// Indexed rather than ranged so one route can be repeated: a rate limit with
+	// a short stated wait is the one case where trying the same provider again
+	// beats moving to the next. See the faultRateLimit branch below.
+	retriedRoute := map[int]bool{}
+	for i := 0; i < len(p.Routes); i++ {
+		route := p.Routes[i]
 		pc, ok := s.C.Providers[route.Provider]
 		if !ok {
 			continue
@@ -733,12 +738,47 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				// Rate limited: the provider is fine, this caller is over quota.
 				// Fail over, respect any stated wait, but do not count it as a
 				// health failure.
+				s.Metrics.RateLimited.Add(1)
+
+				// Unless the provider told us to come back soon. A rate limit is
+				// the only fault class here that clears on its own -- account,
+				// refused and terminal never do, and degraded is a health
+				// question rather than a quota one -- so it is the only one where
+				// waiting can beat moving on.
+				//
+				// Gated on a stated Retry-After rather than a guess. Without one
+				// there is no evidence about how long the wait would be, and the
+				// cost of guessing wrong is the caller sitting on a sleep before
+				// failing over anyway. RFC 9110 gives Retry-After in whole
+				// seconds, so the shortest honest instruction is one second:
+				// this is squarely a trade of latency for price, which is why
+				// the ceiling is an operator setting and zero by default.
+				//
+				// Once per route, and it spends an attempt, so a policy of three
+				// routes that retries the first has two providers left rather
+				// than three. Redundancy is the thing being traded away.
+				if limit := time.Duration(s.C.RateLimitRetryMaxMs) * time.Millisecond; limit > 0 &&
+					wait > 0 && wait <= limit && !retriedRoute[i] && event.Attempts < s.C.MaxAttempts {
+					retriedRoute[i] = true
+					s.circuits[route.Provider].release()
+					s.Metrics.RateLimitRetry.Add(1)
+					t := time.NewTimer(wait)
+					select {
+					case <-ctx.Done():
+						t.Stop()
+						fail(504, "deadline exceeded while waiting out a rate limit")
+						return
+					case <-t.C:
+					}
+					i--
+					continue
+				}
+
 				if wait > 0 {
 					s.circuits[route.Provider].cooldown(wait)
 				} else {
 					s.circuits[route.Provider].release()
 				}
-				s.Metrics.RateLimited.Add(1)
 				continue
 			case faultDegraded:
 				// Provider degraded. This is what the breaker is for.

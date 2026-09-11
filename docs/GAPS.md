@@ -387,6 +387,53 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     describing. It now has real bounds spanning the budgets `ParseChat` defaults
     to and the reasoning overruns item 3 records, observed per request.
 
+24. **Two savings levers, both gated on evidence rather than on hope.**
+
+    **Provider prompt caching.** The gateway had counted `cache_read` and
+    `cache_write` tokens since the usage work and never asked for a cache -- it
+    measured a saving it did nothing to obtain. The reason for care is the
+    pricing: a read is roughly a tenth of an input token and a write roughly
+    1.25x, so marking every request is a 25% surcharge on any prefix never
+    reused. Nothing is marked on first sight. A system prompt is marked once the
+    same one is seen again inside the provider's cache lifetime, which is the
+    only evidence available that it is a prefix at all.
+
+    Sightings expire with the provider cache, since a write against an expired
+    one can never be read. Prompts below the minimum cacheable length are never
+    marked. The table is capped, because system prompts are caller-supplied and
+    the key space is unbounded by construction. Prompts are hashed rather than
+    stored, per `docs/SECURITY.md`. Off by default, Anthropic only, and it sets
+    `X-Switchboard-Prompt-Cache` and `prompt_cache_marked_total` when it fires --
+    which must be read beside `gen_ai.usage.cache_read.input_tokens`, because a
+    mark with no later read is a surcharge rather than a saving.
+
+    **Waiting out a rate limit instead of failing over.** A rate limit is the
+    only fault class that clears on its own: `account`, `refused` and `terminal`
+    never do, and `degraded` is a health question. So it is the only one where
+    waiting can beat moving on, and the gateway now does -- but only when the
+    provider states a `Retry-After` inside a ceiling the operator set. Without a
+    stated wait there is no evidence, and guessing costs the caller a sleep
+    before failing over anyway.
+
+    It is a trade of latency for price and the gateway cannot tell which the
+    caller wants, so `rate_limit_retry_max_ms` is the operator saying how long
+    their callers will wait to stay on the cheaper route. Zero by default, which
+    is the previous behaviour. Once per route, and it spends an attempt: a policy
+    of three routes that retries the first has two providers left rather than
+    three. Redundancy is what is being traded away, and
+    `rate_limit_retry_total` is how often that trade was made.
+
+    **What was considered and rejected: provider status pages.** They lag -- the
+    circuit breaker opens after three failures where a status page updates in
+    minutes -- they add a dependency to answer a question already answered, and
+    they structurally cannot know about *this account*. A 429 from your own quota
+    and an account with no credits never appear on one, and `faultAccount` is
+    exactly where local experience diverges from global status. The better
+    version of that idea is item 13: the circuit breaker is already a
+    downdetector that knows the right things, and it is per process. Sharing it
+    across a fleet would give every gateway what one of them learned, with no new
+    dependency.
+
 ## Still open
 
 1. **Deployment is proven for the quickstart only.** `quickstart.yaml` has been

@@ -96,6 +96,16 @@ type Config struct {
 	// directions, which is why prompt_cache_marked_total exists and why the
 	// response says when it happened.
 	PromptCaching bool `json:"prompt_caching"`
+	// RateLimitRetryMaxMs retries the same provider when a 429 names a wait no
+	// longer than this. Zero disables it, which is the default and the previous
+	// behaviour: fail over immediately.
+	//
+	// It buys price with latency. Waiting a second for a cheap route beats
+	// paying a dearer one for a batch workload and is the wrong trade for an
+	// interactive one, and nothing here can tell which this is -- so the number
+	// is the operator saying how long their callers will wait to stay on the
+	// cheaper route.
+	RateLimitRetryMaxMs int `json:"rate_limit_retry_max_ms"`
 	// CaptureTTLSeconds enables replay capture and sets how long a record lives.
 	// Zero disables it, and zero is the default, for the same reason the
 	// idempotency store defaults off and more so: a record holds the prompt as

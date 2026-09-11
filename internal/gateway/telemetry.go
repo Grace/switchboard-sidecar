@@ -56,6 +56,12 @@ type Metrics struct {
 	// means pay the provider, a refusal means fix a credential or a model name --
 	// and apart from Errors because the caller was served.
 	RefusedFailover atomic.Int64
+	// RateLimitRetry counts requests that waited out a stated Retry-After on the
+	// same provider rather than failing over. Each one traded latency for price
+	// and spent an attempt doing it, so read it beside requests_total: a large
+	// share means callers are waiting often, which is the cost side of that
+	// setting.
+	RateLimitRetry atomic.Int64
 	// PromptCacheMarked counts requests sent with a cache_control breakpoint on
 	// the system prompt. Each one is a bet that the prefix will be read back
 	// before the cache expires; read gen_ai.usage.cache_read.input_tokens beside
@@ -343,6 +349,7 @@ func (m *Metrics) series() []series {
 		{"account_failover_total", "counter", &m.AccountFailover},
 		{"refused_failover_total", "counter", &m.RefusedFailover},
 		{"prompt_cache_marked_total", "counter", &m.PromptCacheMarked},
+		{"rate_limit_retry_total", "counter", &m.RateLimitRetry},
 		{"provider_probe_failed_total", "counter", &m.ProviderProbeFailed},
 		{"budget_skip_total", "counter", &m.BudgetSkip},
 		{"temperature_dropped_total", "counter", &m.TemperatureDropped},
