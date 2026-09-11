@@ -132,20 +132,54 @@ func NewIdemStore(dir string, ttl time.Duration, limit int64, m *Metrics) (*idem
 //
 // It also made docs/SECURITY.md's claim that entries expire with the TTL false.
 func (s *idemStore) Sweep() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Unlocked scan, bounded pass, mutex held only for the accounting. This held
+	// s.mu across the whole ReadDir and an unbounded delete loop, once a minute,
+	// while begin, finish, release and write contend on the same mutex from the
+	// request path -- so every retry-bearing request queued behind a directory
+	// walk. capture.go rejected exactly this pattern, naming it as inherited
+	// from here; the fix travelled the other way at last.
+	//
+	// Deleting outside the lock is safe because the filesystem is the store of
+	// record: a request that reads a file this sweep is about to remove gets the
+	// entry it would have got a moment earlier, and one that arrives after gets
+	// a miss, which is what an expired entry means.
 	entries, _ := os.ReadDir(s.dir)
+	type victim struct {
+		name string
+		size int64
+	}
+	var expired []victim
 	for _, e := range entries {
 		i, err := e.Info()
 		if err != nil || time.Since(i.ModTime()) <= s.ttl {
 			continue
 		}
-		if os.Remove(filepath.Join(s.dir, e.Name())) == nil {
-			s.used -= i.Size()
-			s.count--
+		expired = append(expired, victim{e.Name(), i.Size()})
+		if len(expired) >= idemSweepPerPass {
+			break
 		}
 	}
+	for _, v := range expired {
+		if os.Remove(filepath.Join(s.dir, v.name)) != nil {
+			continue
+		}
+		s.mu.Lock()
+		s.used -= v.size
+		s.count--
+		s.mu.Unlock()
+	}
 }
+
+// idemSweepPerPass bounds one sweep, so a tick costs the same whether the
+// directory holds ten entries or a million.
+//
+// Its own constant rather than capture.go's sweepPerPass, which is deliberate:
+// the two directories are not the same shape. Capture writes a file for every
+// request, including 401s and policy refusals; this one writes only for requests
+// that carried an idempotency key. Sharing the number would imply it had been
+// tuned for both, and the next person to change one would silently change the
+// other.
+const idemSweepPerPass = 2000
 
 // path derives a filename from the key by hashing it. A key is caller-supplied
 // and would otherwise be a path traversal straight into the data directory.

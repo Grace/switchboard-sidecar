@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -865,5 +866,95 @@ func TestWouldAllowDoesNotClaimTheProbe(t *testing.T) {
 	}
 	if c.wouldAllow() {
 		t.Error("wouldAllow reports available while the probe is in flight")
+	}
+}
+
+// End to end, because the unit tests for this could not see it.
+//
+// A stream that breaks after its first byte has already committed HTTP 200 --
+// stream() writes an SSE error frame, and a status line cannot be withdrawn. The
+// telemetry used to record 502 for that request anyway, so the span described a
+// status the client never received.
+//
+// Both halves are asserted here rather than on a hand-built Event, because the
+// defect lived in the wiring: the span is only wrong if chat() puts the wrong
+// number on the event, and the error count is only right if it stops keying on
+// status alone. Constructing an Event directly tests neither.
+func TestBrokenStreamRecordsTheSentStatusAndStillCountsAsAnError(t *testing.T) {
+	provider := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// One real delta, so bytes reach the client and 200 is committed...
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"par\"}}]}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// ...then the stream simply stops: no finish reason, no [DONE].
+	}))
+	defer provider.Close()
+
+	var mu sync.Mutex
+	spans := []byte(nil)
+	collector := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		if bytes.Contains(b, []byte("resourceSpans")) {
+			spans = append(spans, b...)
+		}
+		mu.Unlock()
+		w.Write([]byte(`{}`))
+	}))
+	defer collector.Close()
+
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: provider.URL, KeyEnv: "PROVIDER_KEY"}})
+	tel, err := NewTelemetry(Config{
+		DataDir: t.TempDir(), ControlURL: "http://127.0.0.1:1", OTLPURL: collector.URL,
+		QueueSize: 8, SpoolBytes: 1 << 20,
+	}, s.Metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	useTestTransport(tel.http)
+	ctx, cancel := context.WithCancel(context.Background())
+	tel.Start(ctx)
+	s.Telemetry = tel
+
+	w := call(s, `{"model":"preferred","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	// The wire: 200, with the error frame the contract promises.
+	if w.Code != 200 {
+		t.Fatalf("client saw %d; a committed stream cannot withdraw its status", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "stream_error") {
+		t.Fatalf("no error frame on the wire: %s", w.Body)
+	}
+
+	// Still an error as far as anyone counting is concerned.
+	if n := s.Metrics.Errors.Load(); n != 1 {
+		t.Errorf("Errors = %d, want 1; a broken stream stopped being counted when the "+
+			"count keyed on status alone", n)
+	}
+
+	// The export is asynchronous, so wait for it rather than cancelling out from
+	// under it.
+	var body string
+	for i := 0; i < 100 && body == ""; i++ {
+		mu.Lock()
+		body = string(spans)
+		mu.Unlock()
+		if body == "" {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	cancel()
+	tel.Wait()
+	if body == "" {
+		t.Fatal("no span exported")
+	}
+	// The span agrees with the wire, and says what went wrong.
+	if !strings.Contains(body, `"stringValue":"stream_error"`) {
+		t.Errorf("span carries no stream_error error.type:\n%s", body)
+	}
+	if strings.Contains(body, `"intValue":"502"`) {
+		t.Errorf("span reports a 502 for a request the client saw as 200:\n%s", body)
 	}
 }

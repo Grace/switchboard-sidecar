@@ -448,7 +448,11 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			s.Metrics.ObserveRoute(event.Provider, event.Model, event.Status,
 				time.Since(start).Milliseconds(), event.Usage)
 		}
-		if event.Status >= 400 {
+		// A committed stream that broke is a failed request with a 200 on it, so
+		// the error count cannot key on status alone. This is a correctness fix
+		// to one span attribute, not a redefinition of what counts as an error:
+		// the same requests are counted before and after.
+		if event.Status >= 400 || event.StreamFailed {
 			s.Metrics.Errors.Add(1)
 		}
 		if s.Telemetry != nil {
@@ -816,7 +820,11 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			event.Usage = streamed.usage
 			s.circuits[route.Provider].result(err != nil)
 			if err != nil {
-				event.Status = 502
+				// Not 502. The error frame stream() just wrote committed HTTP
+				// 200, so 200 is what the client saw and what
+				// http.response.status_code has to say. The failure travels in
+				// StreamFailed, which drives error.type instead.
+				event.StreamFailed = true
 				idemSettled = s.settleUnknown(idemKey, hashBody(b))
 			} else {
 				s.budgets.observeOutcome(route.Provider, route.Model, c.MaxTokens, streamed.finish, streamed.text)

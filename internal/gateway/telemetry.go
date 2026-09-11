@@ -532,6 +532,19 @@ type Event struct {
 	// decision nothing type-checks.
 	Model string `json:"-"`
 	Fault string `json:"-"`
+	// StreamFailed records that a streaming response broke after the status line
+	// was already on the wire.
+	//
+	// It exists because Status cannot carry it. stream() writes an SSE error
+	// frame, which commits HTTP 200, and the status then cannot be withdrawn --
+	// so the client observed a 200. This used to record 502 anyway, which made
+	// http.response.status_code describe a status that was never sent, and left
+	// the wire and the telemetry disagreeing about the same request.
+	//
+	// The conventions have the right home for this: error.type is defined for an
+	// operation that ended in an error, independent of the status code. So the
+	// status stays truthful at 200 and the failure is carried here.
+	StreamFailed bool `json:"-"`
 	// Usage is what the provider said the request cost. adapter.go already
 	// normalises four incompatible usage shapes into these five numbers and,
 	// until now, used them only to decide whether a provider's own totals added
@@ -566,6 +579,9 @@ func (e Event) wire() Event {
 	}
 	if e.Fault != "" {
 		ext["fault"] = e.Fault
+	}
+	if e.StreamFailed {
+		ext["stream_failed"] = true
 	}
 	for _, a := range e.Usage.attrs() {
 		ext[a.key] = a.value
@@ -1368,7 +1384,7 @@ func (t *Telemetry) spanOf(e Event) map[string]any {
 	if e.ParentID != "" {
 		span["parentSpanId"] = e.ParentID
 	}
-	if e.Status >= 400 {
+	if e.Status >= 400 || e.StreamFailed {
 		span["status"] = map[string]any{"code": 2}
 		// The span status above is correct and not enough on its own: Honeycomb's
 		// error-rate detection reads error.type, error.message, exception.type and
@@ -1388,8 +1404,17 @@ func (t *Telemetry) spanOf(e Event) map[string]any {
 		// docs/SECURITY.md promises neither appears in product telemetry. One
 		// recognised attribute is enough to be monitored; it is not worth a
 		// written guarantee.
+		// The status code is the honest taxonomy where there is one: every fail()
+		// in server.go picks a distinct status for a distinct cause. A stream
+		// that broke after its status line has no such code -- 200 was sent and
+		// is true -- so it carries the same token the error frame already put on
+		// the wire, and the client's frame and the span agree.
+		et := strconv.Itoa(e.Status)
+		if e.StreamFailed && e.Status < 400 {
+			et = "stream_error"
+		}
 		span["attributes"] = append(span["attributes"].([]any),
-			map[string]any{"key": "error.type", "value": map[string]any{"stringValue": strconv.Itoa(e.Status)}})
+			map[string]any{"key": "error.type", "value": map[string]any{"stringValue": et}})
 	}
 	return span
 }

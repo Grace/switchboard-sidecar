@@ -355,3 +355,54 @@ func TestBedrockStreamAgainstRealService(t *testing.T) {
 	t.Logf("live bedrock stream: %d frames, finish=%s, in=%d out=%d, text=%q",
 		frames, final.Finish, final.Input, final.Output, text.String())
 }
+
+// The retained usage payload must not alias the decoder's buffer.
+//
+// translateBedrockStream holds msg.Payload from the metadata event until the
+// stream ends, and the vendored eventstream decoder builds every payload over
+// the same caller-supplied buffer. Retaining the slice means the next Decode
+// overwrites the token counts in place.
+//
+// Today that is invisible, because Bedrock sends metadata last and nothing
+// decodes after it. This test removes that coincidence rather than trusting it:
+// one more frame arrives after metadata, which is what AWS reordering or adding
+// an event would look like. The failure it guards against is the quiet kind --
+// the numbers still parse, so usage_mismatch_total does not fire and the caller
+// is simply billed against the wrong figures.
+func TestBedrockUsageSurvivesALaterFrame(t *testing.T) {
+	var raw bytes.Buffer
+	bedrockFrame(t, &raw, "messageStart", `{"role":"assistant"}`)
+	bedrockFrame(t, &raw, "contentBlockDelta", `{"delta":{"text":"hi"},"contentBlockIndex":0}`)
+	bedrockFrame(t, &raw, "messageStop", `{"stopReason":"end_turn"}`)
+	bedrockFrame(t, &raw, "metadata", `{"usage":{"inputTokens":11,"outputTokens":7,"totalTokens":18}}`)
+	// An event the switch does not handle, so the loop continues and the decoder
+	// reuses the buffer the metadata payload was built over. Padded past the
+	// metadata payload's length so an aliased slice is fully clobbered rather
+	// than left as plausible-looking truncated JSON.
+	bedrockFrame(t, &raw, "contentBlockStop",
+		`{"contentBlockIndex":0,"pad":"`+strings.Repeat("x", 200)+`"}`)
+
+	var got normalized
+	done := false
+	err := readSSE(bedrockSSE(io.NopCloser(&raw), 1<<20), func(b []byte) error {
+		n, complete, e := normalize("bedrock", b, true)
+		if e != nil {
+			return e
+		}
+		if complete {
+			got, done = n, true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("translating the event stream failed: %v", err)
+	}
+	if !done {
+		t.Fatal("stream never reported completion")
+	}
+	if got.Input != 11 || got.Output != 7 {
+		t.Errorf("usage = in %d/out %d, want 11/7; the retained payload was overwritten "+
+			"by a later decode, which is silent billing corruption rather than an error",
+			got.Input, got.Output)
+	}
+}

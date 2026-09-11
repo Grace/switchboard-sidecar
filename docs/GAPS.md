@@ -930,33 +930,68 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     second**: a nil Go slice marshals to `null` where Python's `json.dumps([])`
     emits `[]`, and the checked-in fixtures would not catch it.
 
-20. **Three defects recorded rather than fixed, with the reasoning.**
+20. **Three defects that were recorded rather than fixed, now fixed.** The
+    entry below used to argue for leaving each one. Two of those arguments had
+    expired and the third was aimed at a change nobody needed to make.
 
-    **`idemStore.Sweep` holds the store mutex across a full `os.ReadDir` and an
-    unbounded delete loop**, and runs every minute while `begin`/`finish`/`write`
-    contend on the same mutex on the request path. `capture.go` documents this
-    exact pattern as one it deliberately avoided -- "inherited from
-    idempotency.go" -- and added both an unlocked scan and a `sweepPerPass`
-    bound; the idempotency store got neither. Left because it is reachable only
-    with `idempotency_ttl_seconds` set, which is off by default. The fix is to
-    copy what `capture.go` already does.
+    **`idemStore.Sweep` held the store mutex across a full `os.ReadDir` and an
+    unbounded delete loop**, once a minute, while `begin`, `finish`, `release`
+    and `write` contend on the same mutex from the request path. `capture.go`
+    had already rejected this pattern and said where it came from -- "inherited
+    from idempotency.go" -- so the fix existed in the repository and had simply
+    never travelled back. It now scans unlocked, bounds the pass at
+    `idemSweepPerPass`, and takes the mutex only for the per-file accounting.
+    The bound is its own constant rather than `capture.go`'s: capture writes a
+    file for every request including 401s and policy refusals, this one only for
+    requests carrying a key, and sharing the number would imply it had been
+    tuned for both.
 
-    **Bedrock `usage` aliases the decoder's reused scratch buffer.**
-    `translateBedrockStream` retains `msg.Payload` from the `metadata` event, and
-    the vendored eventstream decoder builds payloads over the caller's buffer, so
-    the next `Decode` overwrites it in place. Benign only because Bedrock sends
-    `metadata` last and no further decode succeeds. It becomes silent billing
-    corruption -- wrong token counts returned to the caller, no error -- the day
-    AWS emits anything after `metadata` or reorders it before `messageStop`.
+    The old reason -- reachable only when `idempotency_ttl_seconds` is set, which
+    is off by default -- was a reason to rank it last, not to keep known lock
+    contention in the store whose entire job is being correct under concurrent
+    retries.
 
-    **A stream that fails before its first byte reports 200 to the client and 502
-    to telemetry.** `stream()` writes an SSE error frame, implicitly committing
-    HTTP 200, while `chat()` sets `event.Status = 502`, so the span carries
-    `error.type` and a 502 status code for a request the client observed as a
-    200. Defensible as an SSE design -- the status is already sent and cannot be
-    withdrawn -- but the wire and the telemetry disagree, and anyone reading an
-    error rate is misled. Changing it would touch the streaming contract in
-    `docs/API.md`, so it is written down instead.
+    **Bedrock `usage` aliased the decoder's reused scratch buffer.**
+    `translateBedrockStream` retained `msg.Payload` from the `metadata` event,
+    and the vendored eventstream decoder builds payloads over the caller's
+    buffer, so the next `Decode` overwrote the token counts in place. It was
+    benign only because Bedrock sends `metadata` last -- a property of AWS's
+    emission order, not of this code. `bytes.Clone`, one allocation per stream,
+    on the terminal frame.
+
+    The test does not guess at AWS's ordering: it puts one more frame after
+    `metadata`, which is what a reorder or an added event would look like, and
+    asserts the counts survive. Against the old code they came back as 0 and 0 --
+    which is the shape of this defect, since the numbers still parse,
+    `usage_mismatch_total` does not fire, and the caller is billed against
+    figures nothing flags.
+
+    **A failed stream reported 200 on the wire and 502 to telemetry.** The old
+    entry left this because changing it "would touch the streaming contract in
+    `docs/API.md`." It does not. The wire behaviour was right and is unchanged:
+    `stream()` writes an SSE error frame, which commits HTTP 200, and a status
+    line cannot be withdrawn. What was wrong was telemetry describing a status
+    that was never sent.
+
+    `http.response.status_code` is now 200, because that is the code the response
+    carried. The failure is expressed by `error.type`, which the conventions
+    define for an operation that ended in an error independently of its status,
+    and its value is `stream_error` -- the same token the error frame already
+    puts on the wire, so the client's frame and the span agree. A new
+    `Event.StreamFailed` carries it, reaching the control plane through `ext`.
+
+    `switchboard_errors_total` counts exactly what it counted before: the error
+    count no longer keys on status alone, because a committed stream that broke
+    is a failed request with a 200 on it. This is a correctness fix to one span
+    attribute, not a redefinition of what an error is.
+
+    **Two of the five mutation checks failed to fail**, which is its own finding.
+    Reverting the status to 502, and dropping the stream failure from the error
+    count, both passed a suite that was constructing `Event` values by hand. The
+    defect had always lived in the wiring rather than in the span builder, so
+    `TestBrokenStreamRecordsTheSentStatusAndStillCountsAsAnError` drives a real
+    provider stream that dies after its first byte and asserts the wire, the
+    counter and the exported span together.
 
 21. **The enterprise carve-out is deferred, not dropped.** The project is
     Apache 2.0 as of 2026-09-09, having gone MIT → Elastic License 2.0

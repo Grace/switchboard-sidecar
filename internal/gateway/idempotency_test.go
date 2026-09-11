@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -321,4 +322,81 @@ func TestIdemFullStoreRecoversAfterSweep(t *testing.T) {
 		t.Errorf("still refusing new keys after Sweep: %v. Until this passes, a full "+
 			"store means idempotency is off and duplicate requests are billed twice", err)
 	}
+}
+
+// A sweep must not hold the store mutex across the directory scan.
+//
+// It did, once a minute, while begin, finish, release and write contend on the
+// same mutex from the request path -- so every retry-bearing request queued
+// behind a full ReadDir. capture.go had already rejected the pattern and named
+// this file as where it came from.
+//
+// Asserted by arithmetic rather than by timing: a timing test on a mutex is
+// flaky on a loaded machine and proves nothing on a fast one. The sweep is given
+// more expired entries than one pass may take, and the bound is what a locked,
+// unbounded loop cannot satisfy.
+func TestSweepIsBoundedPerPass(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewIdemStore(dir, time.Millisecond, 1<<30, &Metrics{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = idemSweepPerPass + 250
+	old := time.Now().Add(-time.Hour)
+	for i := 0; i < n; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("%064x", i))
+		if err := os.WriteFile(p, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s.Sweep()
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := n - idemSweepPerPass; len(left) != want {
+		t.Errorf("after one sweep %d entries remain, want %d; the pass is not bounded, "+
+			"so a tick costs O(directory) and blocks every request that takes the mutex",
+			len(left), want)
+	}
+	// And it converges: the remainder goes on the next pass.
+	s.Sweep()
+	if left, _ := os.ReadDir(dir); len(left) != 0 {
+		t.Errorf("%d entries survived a second sweep", len(left))
+	}
+}
+
+// The request path must keep working while a sweep runs. Under -race this also
+// covers the accounting, which is now updated outside the scan.
+func TestSweepDoesNotBlockTheRequestPath(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewIdemStore(dir, time.Millisecond, 1<<30, &Metrics{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	for i := 0; i < 500; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("%064x", i))
+		os.WriteFile(p, []byte("{}"), 0o600)
+		os.Chtimes(p, old, old)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Sweep()
+	}()
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("live-%d", i)
+		if _, err := s.begin(key, []byte(`{"a":1}`)); err != nil {
+			t.Errorf("begin during sweep: %v", err)
+			break
+		}
+		s.release(key)
+	}
+	<-done
 }

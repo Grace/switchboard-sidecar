@@ -275,7 +275,18 @@ func translateBedrockStream(r io.Reader, w io.Writer, limit int64) error {
 			// Held, not emitted: see the note above.
 			stop = e.StopReason
 		case "metadata":
-			usage = msg.Payload
+			// Cloned, not retained. The vendored eventstream decoder builds each
+			// payload over the caller's buffer, so holding this slice means the
+			// next Decode overwrites the token counts in place.
+			//
+			// That is benign only because Bedrock sends metadata last and no
+			// later decode succeeds -- a property of AWS's current emission
+			// order, not of this code. The day anything follows metadata, or it
+			// moves ahead of messageStop, the caller is handed wrong token counts
+			// with no error: the numbers still parse, so UsageMismatch does not
+			// fire and nothing downstream can tell. One allocation, once per
+			// stream, on the terminal frame.
+			usage = bytes.Clone(msg.Payload)
 		}
 	}
 	if stop == "" {

@@ -1385,3 +1385,75 @@ func TestLabelValuesAreEscaped(t *testing.T) {
 		t.Errorf("joinLabels = %s, want %s", got, want)
 	}
 }
+
+// The wire and the telemetry have to agree about what the client saw.
+//
+// stream() writes an SSE error frame when a stream breaks, which commits HTTP
+// 200; the status cannot then be withdrawn. chat() used to record 502 anyway, so
+// the span carried http.response.status_code 502 for a request the client
+// observed as a 200 -- and anyone reading an error rate was looking at a status
+// that was never sent.
+//
+// The status is now truthful and the failure is carried by error.type, which the
+// conventions define for an operation that ended in an error independent of its
+// status. The value matches the token already on the wire in the error frame.
+func TestFailedStreamReportsTheStatusTheClientSaw(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+	tel.exportOTLP(context.Background(), Event{
+		ID: "a", TraceID: "t", SpanID: "s", Provider: "openai", Model: "gpt-5-nano",
+		Status: 200, Attempts: 1, Start: 1, End: 2, StreamFailed: true,
+	})
+	attrs, span := spanAttrs(t, got)
+
+	if attrs["http.response.status_code"] != "200" {
+		t.Errorf("http.response.status_code = %q, want 200; that is what was sent",
+			attrs["http.response.status_code"])
+	}
+	if attrs["error.type"] != "stream_error" {
+		t.Errorf("error.type = %q, want stream_error; a 200 with no error.type is a "+
+			"failed request that reads as a success", attrs["error.type"])
+	}
+	// The span status still marks it an error, which is what a backend reads
+	// before it reads any attribute.
+	st, ok := span["status"].(map[string]any)
+	if !ok || st["code"] != float64(2) {
+		t.Errorf("span status = %v, want code 2", span["status"])
+	}
+}
+
+// A successful stream must not pick up an error.type, or every stream reads as
+// broken.
+func TestSuccessfulStreamCarriesNoError(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+	tel.exportOTLP(context.Background(), Event{
+		ID: "a", TraceID: "t", SpanID: "s", Provider: "openai", Model: "gpt-5-nano",
+		Status: 200, Attempts: 1, Start: 1, End: 2,
+	})
+	attrs, span := spanAttrs(t, got)
+	if v, ok := attrs["error.type"]; ok {
+		t.Errorf("error.type = %q on a stream that succeeded", v)
+	}
+	if _, ok := span["status"]; ok {
+		t.Errorf("span status set on a success: %v", span["status"])
+	}
+}
+
+// It reaches the control plane too, where replay reads it.
+func TestStreamFailureReachesControlPlaneThroughExt(t *testing.T) {
+	e := Event{ID: "a", Provider: "openai", Status: 200, StreamFailed: true}.wire()
+	if e.Ext["stream_failed"] != true {
+		t.Errorf("ext[stream_failed] = %v, want true", e.Ext["stream_failed"])
+	}
+}
