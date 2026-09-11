@@ -321,7 +321,13 @@ def create_app(pool=None, seed=None, key_id=None):
               sum((event->'ext'->>'gen_ai.usage.cache_write.input_tokens')::bigint) AS cache_write,
               count(*) FILTER (WHERE (event->>'attempts')::int > 1)        AS failed_over,
               count(*) FILTER (WHERE event->'ext'->>'idempotent_replay' = 'true') AS replays,
-              count(*) FILTER (WHERE event->'ext' ? 'budget_skipped')      AS budget_skipped
+              count(*) FILTER (WHERE event->'ext' ? 'budget_skipped')      AS budget_skipped,
+              -- Routes the loop passed over without calling. The breaker's most
+              -- valuable work: a provider call not made is not billed and not
+              -- waited on, and it is why a run of failures produces far fewer
+              -- failovers than requests.
+              coalesce(sum(jsonb_array_length(event->'ext'->'skipped')) FILTER (
+                WHERE jsonb_typeof(event->'ext'->'skipped') = 'array'), 0) AS routes_skipped
             FROM telemetry
             WHERE received_at > now() - make_interval(hours => %s)
             GROUP BY 1, 2
@@ -361,6 +367,10 @@ def create_app(pool=None, seed=None, key_id=None):
                 "budget_skipped_requests": total("budget_skipped"),
             },
             "failed_over_requests": total("failed_over"),
+            # Counted, never priced. A skipped route is a call that did not
+            # happen, and converting that to money would need a rate table this
+            # service deliberately does not have.
+            "routes_skipped": total("routes_skipped"),
         }
 
     @app.get("/v1/requests")
@@ -426,6 +436,64 @@ def create_app(pool=None, seed=None, key_id=None):
             # chart that lies by omission.
             "truncated": len(rows) >= limit,
             "rows": [dict(r) for r in rows],
+        }
+
+    @app.get("/v1/requests/{request_id}")
+    def request_detail(request_id: str, s=Depends(session, scope="function")):
+        """One request in full: every attempt, and every route passed over.
+
+        A second endpoint rather than a column on /v1/requests. That one is a
+        wide scan projected to eight numbers per row and is read to draw charts;
+        attaching a JSON array of attempts to every row would bloat the common
+        path in order to serve the rare one.
+
+        What it adds is the per-attempt record. /v1/requests says a request made
+        two attempts and what it cost in total; this says the first attempt went
+        to one provider, returned 200 with no text, and was billed 1024 tokens
+        for it. That is the difference between knowing a failover happened and
+        knowing what it cost.
+
+        Same read set and the same reasoning as its neighbours: this is one row
+        of the events a viewer can already read. No prompts and no completions --
+        captured content never reaches the control plane at all.
+        """
+        db, p = s
+        require(p, "admin", "publisher", "viewer")
+        # The Event model pins request_id to 32 hex characters, so this checks
+        # the same shape rather than the looser identifier pattern. The query is
+        # parameterised either way; this is about rejecting a malformed lookup
+        # with 400 instead of scanning for something that cannot exist.
+        if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+            raise HTTPException(400, "request_id must be 32 hex characters")
+
+        row = db.execute(
+            """SELECT event, received_at FROM telemetry
+                WHERE event->>'request_id' = %s
+                ORDER BY received_at DESC LIMIT 1""",
+            (request_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "no such request in this tenant's telemetry")
+
+        e = row["event"]
+        ext = e.get("ext") or {}
+        return {
+            "request_id": e.get("request_id"),
+            "trace_id": e.get("trace_id"),
+            "received_at": row["received_at"],
+            "status": e.get("status"),
+            "attempts": e.get("attempts"),
+            "provider": e.get("provider"),
+            "model": ext.get("model"),
+            "requested_model": ext.get("requested_model"),
+            "policy_version": e.get("policy_version"),
+            "duration_ms": (e.get("end_ns", 0) - e.get("start_ns", 0)) // 1_000_000,
+            "fault": ext.get("fault"),
+            # The per-attempt record, each with its own token usage. Absent on a
+            # request that never reached a provider, which is a fact rather than
+            # a gap -- the request was answered without calling anyone.
+            "tries": ext.get("tries", []),
+            # Routes passed over without being called, with the reason.
+            "skipped": ext.get("skipped", []),
         }
 
     @app.get("/dashboard", response_class=HTMLResponse)
