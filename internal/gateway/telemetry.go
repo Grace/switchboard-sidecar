@@ -1290,12 +1290,31 @@ func semconvOf(provider string) semconv {
 
 func (t *Telemetry) spanOf(e Event) map[string]any {
 	sc := semconvOf(e.Provider)
-	attrs := []any{
-		map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": sc.provider}},
-		// Required by the convention on both the span and the token-usage metric,
-		// and previously absent -- which is what made these spans non-conformant
-		// rather than merely sparse, since it is the primary grouping key.
-		map[string]any{"key": "gen_ai.operation.name", "value": map[string]any{"stringValue": sc.operation}},
+	// A request refused before any route was chosen is not a GenAI operation, and
+	// must not dress itself as one. Auth failures, policy refusals, rate-limit
+	// rejections and idempotent replays all reach here with no provider, and this
+	// used to emit gen_ai.provider.name="" -- an empty string is not one of the
+	// enum's values and not a custom value either -- and name the span "chat",
+	// claiming a chat completion that never happened.
+	//
+	// Found by genai-interlingua, which reported the span was not a faithful
+	// carrier of gen_ai.provider.name. Nothing in this repository caught it,
+	// because everything in this repository was checking the emitter against
+	// tables the emitter was built from. See conformance_test.go.
+	//
+	// The same gate the latency histogram uses: a provider is set once a route is
+	// picked, so its absence is exactly "this never reached a provider".
+	attrs := []any{}
+	if e.Provider != "" {
+		attrs = append(attrs,
+			map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": sc.provider}},
+			// Required by the convention on both the span and the token-usage
+			// metric, and previously absent -- which is what made these spans
+			// non-conformant rather than merely sparse, since it is the primary
+			// grouping key.
+			map[string]any{"key": "gen_ai.operation.name", "value": map[string]any{"stringValue": sc.operation}})
+	}
+	attrs = append(attrs,
 		map[string]any{"key": "http.response.status_code", "value": map[string]any{"intValue": strconv.Itoa(e.Status)}},
 		// What the routing loop decided, which the span used to drop on the floor.
 		// The metrics already count how often failover happens; without these,
@@ -1308,8 +1327,7 @@ func (t *Telemetry) spanOf(e Event) map[string]any {
 		// fault stay under switchboard.* because they describe routing, and no
 		// OpenTelemetry convention covers a router yet; an experimental namespace
 		// is what OpenTelemetry asks for while that is true.
-		map[string]any{"key": "switchboard.attempts", "value": map[string]any{"intValue": strconv.Itoa(e.Attempts)}},
-	}
+		map[string]any{"key": "switchboard.attempts", "value": map[string]any{"intValue": strconv.Itoa(e.Attempts)}})
 	if e.PolicyVersion > 0 {
 		// On the span as well as the event, so a trace answers "which policy sent
 		// it here" without a database round trip.
@@ -1336,9 +1354,15 @@ func (t *Telemetry) spanOf(e Event) map[string]any {
 	// "chat " with a trailing space is not a name. Fall back to the operation
 	// alone, which is still the convention's first half rather than a third
 	// vocabulary.
-	name := sc.operation
-	if e.Model != "" {
-		name += " " + e.Model
+	// "{gen_ai.operation.name} {gen_ai.request.model}" only where an operation
+	// actually took place. Where none did, the span says what it is instead of
+	// borrowing a vocabulary it has no claim on.
+	name := "switchboard.refused"
+	if e.Provider != "" {
+		name = sc.operation
+		if e.Model != "" {
+			name += " " + e.Model
+		}
 	}
 	span := map[string]any{"traceId": e.TraceID, "spanId": e.SpanID, "name": name, "kind": 2, "startTimeUnixNano": strconv.FormatInt(e.Start, 10), "endTimeUnixNano": strconv.FormatInt(e.End, 10), "attributes": attrs}
 	if e.ParentID != "" {

@@ -348,6 +348,37 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     plausible and is wrong everywhere except the first bucket, so the conversion
     lives in one function and both directions are asserted.
 
+    **Conformance is now checked from outside this repository.** Everything above
+    was asserted against tables this repository also wrote, which is a closed
+    loop: the provider enum was checked against the same four strings the code
+    emitted, so a wrong pair agreed with itself. That is precisely how `bedrock`
+    and `gemini` survived.
+
+    `genai-interlingua` is an independent implementation of the conventions,
+    built from spans captured off six other instrumentation libraries, and it has
+    never heard of Switchboard. `internal/gateway/conformance_test.go` pipes this
+    gateway's spans through it and asserts two things: the dialect comes back
+    `raw` (native `gen_ai.*`, not something it recognises as another library's),
+    and `interlingua.lossy` -- the keys a span is not a faithful carrier of -- is
+    empty. Reverting either provider name makes it fail, naming
+    `gen_ai.provider.name` without being told what to look for.
+
+    **It found a defect on its first run.** A request refused before any route was
+    chosen -- an auth failure, a policy refusal, a rate-limit rejection, an
+    idempotent replay -- was emitting `gen_ai.provider.name=""` and naming its
+    span `chat`. An empty string is not one of the enum's values and is not a
+    custom value either, and the span was claiming a chat completion that never
+    happened. Those requests are not GenAI operations and now carry no `gen_ai.*`
+    at all; the span is named `switchboard.refused` and says what it is. The gate
+    is the one the latency histogram already used: a provider is set once a route
+    is picked, so its absence is exactly "this never reached a provider".
+
+    The test is skipped unless the binary is installed, which proves nothing on
+    its own; `SWITCHBOARD_REQUIRE_INTERLINGUA=1` turns a missing binary into a
+    failure. The target is pinned to `v1.41.0` rather than defaulted, for the
+    reason that project documents and which now applies here too: there is no
+    released version of `gen_ai.*` to normalize to.
+
     **A defect of my own, found and fixed in the same pass.** The first version
     of `gen_ai.client.token.usage` was a degenerate histogram: a single bound
     with a correct sum and a meaningless shape. Cost queries would have been

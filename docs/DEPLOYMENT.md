@@ -392,6 +392,28 @@ four minutes in, after the VPC, NAT gateway and database had started building.
 The template pattern and `scripts/preflight.sh` both reject it now. Pass exactly
 one ARN.
 
+### Putting your other services in the same vocabulary
+
+Switchboard's spans follow the OpenTelemetry GenAI semantic conventions directly,
+so nothing has to translate them. Your other services may not: OpenLLMetry,
+OpenInference, the Vercel AI SDK, LiteLLM and Braintrust each name the same token
+count differently, and a dashboard cannot span all of them at once.
+
+[`genai-interlingua`](https://github.com/Grace/genai-interlingua) normalizes those
+dialects into the same `gen_ai.*` model Switchboard emits, as a Collector
+processor or a CLI. It is not a dependency of this product and nothing here
+requires it -- but if you run it in front of your collector, one query answers
+"what did this cost" across every service regardless of what instrumented it.
+
+If you would rather not run another binary, `interlingua -emit ottl` prints a
+`transform` processor configuration you can paste into the Collector you already
+have. The emitted config states in its own header which attributes that route
+cannot carry, which is the honest part: a subset, and it says which subset.
+
+Switchboard's own test suite points the same tool back at this gateway and
+asserts it finds nothing to translate and nothing lossy. See
+`internal/gateway/conformance_test.go`.
+
 ### Read the OIDC subject before deploying the publishing role
 
 `github-oidc.yaml` writes a trust policy matching the subject claim GitHub puts
