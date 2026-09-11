@@ -1170,6 +1170,56 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     remotes and rewriting published history to fix a sentence is a worse trade
     than a note. `CONTRIBUTING.md` itself is accurate and needs no change.
 
+23. **Only the sidecar shape is deployable, and two more are wanted.** The
+    gateway refuses any listen address that is not loopback -- `Config.Validate`:
+    *"listen must be a loopback IP:port; use one sidecar per tenant"* -- so the
+    only supported deployment is one gateway per tenant, beside the application,
+    in the same task. That serves an internet-facing agent perfectly well: the
+    agent is the public part and calls `127.0.0.1`, and the process holding the
+    provider keys is never reachable from outside the task. It is the shape Envoy
+    and the OpenTelemetry collector use, and it is deliberate.
+
+    Two other shapes are wanted and neither exists.
+
+    **Network-facing, single tenant** -- one gateway per team rather than per
+    service. The work is not relaxing the check. Loopback is currently doing the
+    job of proving the caller is inside the trust boundary, and binding anywhere
+    else removes that proof, so it has to be replaced: TLS with client
+    certificates, and the caller's entitlement read from the certificate rather
+    than from the network. Tenancy does not change -- the gateway still serves
+    one tenant, so the certificate proves entitlement to *this* gateway and
+    nothing more.
+
+    The invariant to build first, because it is what makes the rest safe:
+    `Validate` must refuse a non-loopback listen **unless** TLS and a client CA
+    are configured. Exposure must be impossible by typo, which is the property
+    loopback gives for free today. Then connection and header limits, read and
+    idle timeouts, a TLS floor, and certificate rotation without a restart; and a
+    decision about whether `local_token` becomes a second factor or is retired in
+    favour of certificate identity, rather than both being left in place.
+
+    **Hosted, multi-tenant** -- customers pointing traffic at a service rather
+    than running one. Much larger, and the difficulty is not where it looks. It
+    is not TLS and it is not authentication: it is that the data plane is
+    single-tenant by construction. `Tenant` is a static config field, one signed
+    policy is fetched and verified for it, one `local_token` admits callers, and
+    one data directory spools its telemetry. Every one of those becomes
+    per-request.
+
+    Beyond that: per-tenant policy fetch, verification and caching, with a cache
+    that cannot serve one tenant's policy to another; key custody, which is
+    either holding customer provider keys -- encryption at rest, rotation, and a
+    blast radius that is now everyone's -- or a customer-managed secret
+    reference, which is better and is its own design; per-tenant quotas, rate
+    limits and concurrency, so one tenant cannot exhaust another's capacity; and
+    sitting in the path of customer prompts, with the residency, retention and
+    contractual consequences that brings.
+
+    One real head start: the control plane is already multi-tenant, with
+    `FORCE ROW LEVEL SECURITY` and a `telemetry_tenant` policy keyed on
+    `current_setting('app.tenant')`. The tenancy model exists. It is the gateway
+    that assumes one.
+
 ## Blocked externally
 
 These need an action from the owner or from AWS. **They are not implementation
