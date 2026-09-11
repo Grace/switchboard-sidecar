@@ -56,6 +56,12 @@ type Metrics struct {
 	// means pay the provider, a refusal means fix a credential or a model name --
 	// and apart from Errors because the caller was served.
 	RefusedFailover atomic.Int64
+	// PromptCacheMarked counts requests sent with a cache_control breakpoint on
+	// the system prompt. Each one is a bet that the prefix will be read back
+	// before the cache expires; read gen_ai.usage.cache_read.input_tokens beside
+	// it to see whether the bet paid, because a mark with no later read is a
+	// surcharge rather than a saving.
+	PromptCacheMarked atomic.Int64
 	// ProviderProbeFailed counts providers rejected by the startup check.
 	ProviderProbeFailed atomic.Int64
 	// IdempotentReplay counts responses served from the idempotency store rather
@@ -336,6 +342,7 @@ func (m *Metrics) series() []series {
 		{"empty_completion_failed_total", "counter", &m.EmptyCompletionFailed},
 		{"account_failover_total", "counter", &m.AccountFailover},
 		{"refused_failover_total", "counter", &m.RefusedFailover},
+		{"prompt_cache_marked_total", "counter", &m.PromptCacheMarked},
 		{"provider_probe_failed_total", "counter", &m.ProviderProbeFailed},
 		{"budget_skip_total", "counter", &m.BudgetSkip},
 		{"temperature_dropped_total", "counter", &m.TemperatureDropped},

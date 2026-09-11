@@ -182,6 +182,9 @@ type Server struct {
 	// budgets remembers which models have been seen returning nothing at a given
 	// token budget, so a request is not sent to a route already watched fail.
 	budgets *budgetTable
+	// prefixes decides when a system prompt is worth a provider cache write.
+	// nil unless prompt_caching is configured, and worthCaching tolerates nil.
+	prefixes *prefixCache
 	// temps remembers which models refused a temperature, so the 400 is paid
 	// once per model rather than on every request. See temperature.go.
 	temps *temperatureTable
@@ -213,7 +216,7 @@ type Server struct {
 }
 
 func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
-	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}, budgets: newBudgetTable(), temps: newTemperatureTable()}
+	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}, budgets: newBudgetTable(), temps: newTemperatureTable(), prefixes: promptCacheFor(c)}
 }
 
 // ready reports whether this gateway can serve a request. It deliberately does
@@ -636,6 +639,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// tax on a fact already established.
 			sent.Temperature = nil
 			s.Metrics.TemperatureDropped.Add(1)
+		}
+		// Only Anthropic takes a cache_control breakpoint in this shape. Bedrock
+		// has cachePoint in Converse, which is a different request and a
+		// separate decision; the other two have no equivalent.
+		if route.Provider == "anthropic" && s.prefixes.worthCaching(systemOf(sent)) {
+			sent.CacheSystem = true
+			s.Metrics.PromptCacheMarked.Add(1)
+			w.Header().Set("X-Switchboard-Prompt-Cache", "system")
 		}
 		req, e := upstream(ctx, sent, route, pc, s.Bedrock)
 		if e != nil {

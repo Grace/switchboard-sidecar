@@ -86,6 +86,16 @@ type Config struct {
 	IdempotencyTTLSeconds int `json:"idempotency_ttl_seconds"`
 	// IdempotencyBytes bounds that store the way spool_bytes bounds the spool.
 	IdempotencyBytes int64 `json:"idempotency_bytes"`
+	// PromptCaching asks Anthropic to cache a system prompt once the same one
+	// has been seen twice inside the cache's lifetime. Off by default, because
+	// it changes what the caller's request says: a cache write is billed at
+	// roughly 1.25x input, so this is a wager that the prefix repeats, and a
+	// wager belongs to the operator rather than to a default.
+	//
+	// It never changes the completion. What it changes is price, in both
+	// directions, which is why prompt_cache_marked_total exists and why the
+	// response says when it happened.
+	PromptCaching bool `json:"prompt_caching"`
 	// CaptureTTLSeconds enables replay capture and sets how long a record lives.
 	// Zero disables it, and zero is the default, for the same reason the
 	// idempotency store defaults off and more so: a record holds the prompt as

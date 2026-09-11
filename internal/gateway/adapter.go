@@ -25,6 +25,12 @@ type Chat struct {
 	Stream      bool      `json:"stream"`
 	MaxTokens   int       `json:"max_tokens"`
 	Temperature *float64  `json:"temperature,omitempty"`
+	// CacheSystem asks the provider to cache the system prompt. Decided by the
+	// server from what it has seen before, never by the caller: ParseChat sets
+	// extra="forbid" behaviour on unknown keys, and this one carries no JSON tag
+	// so a request body cannot reach it. A caller who could set it could make
+	// every one-shot prompt pay a cache write.
+	CacheSystem bool `json:"-"`
 }
 
 // supportedFields is the request surface named once, so an error can say which
@@ -130,7 +136,22 @@ func upstream(ctx context.Context, c Chat, r Route, p ProviderConfig, signer *Be
 	case "anthropic":
 		b := map[string]any{"model": r.Model, "messages": msgs, "max_tokens": c.MaxTokens, "stream": c.Stream}
 		if system != "" {
-			b["system"] = system
+			// A bare string unless the prefix is worth caching, because the
+			// structured form is only needed to hang cache_control off, and the
+			// simplest request that works is the one to send.
+			//
+			// ephemeral is the only cache type Anthropic defines. The breakpoint
+			// goes on the system prompt and nowhere else: it is the part that
+			// repeats across callers and turns, and every extra breakpoint is
+			// another thing to be wrong about.
+			if c.CacheSystem {
+				b["system"] = []any{map[string]any{
+					"type": "text", "text": system,
+					"cache_control": map[string]any{"type": "ephemeral"},
+				}}
+			} else {
+				b["system"] = system
+			}
 		}
 		if c.Temperature != nil {
 			b["temperature"] = *c.Temperature
