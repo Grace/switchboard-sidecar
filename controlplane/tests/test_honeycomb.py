@@ -339,3 +339,44 @@ def test_an_already_provisioned_account_creates_nothing_new(monkeypatch, capsys)
     assert ("PUT", "/1/boards/b1") in fake.writes(), (
         f"existing board was not updated; writes were {fake.writes()}"
     )
+
+
+# The API rejects a list of bare ids with "422: incorrect type for field" and
+# declines to say which field. A TriggerNotificationRecipient is an object whose
+# id names an existing recipient, and nothing in the test suite checked the shape
+# of what was actually being sent -- only that a recipient was or wasn't created.
+def test_trigger_recipients_are_objects_not_ids(monkeypatch):
+    sent = []
+
+    def fake(key, method, path, body=None):
+        if path == "/1/auth":
+            return {"type": "configuration", "team": {"slug": "t"},
+                    "environment": {"slug": "e"},
+                    "api_key_access": {"triggers": True, "boards": True,
+                                       "recipients": True, "queries": False}}
+        if path == "/1/recipients":
+            return [{"id": "r1", "type": "email",
+                     "details": {"email_address": "ops@example.com"}}]
+        if path.startswith("/1/triggers"):
+            if method == "GET":
+                return [{"id": "t1", "name": honeycomb.PAGE_TRIGGER},
+                        {"id": "t2", "name": honeycomb.NOTIFY_TRIGGER}]
+            sent.append(body)
+            return {"id": "t1", "query_id": "q1"}
+        if path == "/1/boards":
+            return [{"id": "b1", "name": honeycomb.BOARD_NAME}] if method == "GET" else {
+                "id": "b1", "links": {"board_url": "u"}}
+        if path.startswith("/1/queries"):
+            return {"id": "q1"}
+        if path.startswith("/1/query_annotations"):
+            return {"id": "a1"}
+        return {}
+
+    monkeypatch.setattr(honeycomb, "api", fake)
+    honeycomb.apply("k", "Metrics", "ops@example.com", dry_run=False)
+
+    assert sent, "no trigger was written"
+    for body in sent:
+        for r in body["recipients"]:
+            assert isinstance(r, dict), f"recipient sent as {type(r).__name__}: {r!r}"
+            assert r.get("id"), f"recipient object carries no id: {r!r}"

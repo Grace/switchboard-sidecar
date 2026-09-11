@@ -84,7 +84,17 @@ def api(key: str, method: str, path: str, body=None):
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace").strip()
         try:
-            detail = json.loads(detail).get("error", detail)
+            parsed = json.loads(detail)
+            detail = parsed.get("error", detail)
+            # type_detail is where this API puts the part worth having. The
+            # top-level error reads "The provided input is invalid." for a
+            # missing field, a wrong type, and a field that is merely not allowed
+            # on writes alike; only this array says which field and why. Leaving
+            # it unread cost an hour on "dataset is not allowed on query panels
+            # requests", which the server had been saying all along.
+            for d in parsed.get("type_detail") or []:
+                detail += "\n    {}: {}".format(
+                    d.get("field", "?"), d.get("description") or d.get("code", ""))
         except Exception:
             pass
         if "maximum" in detail and "plan" in detail:
@@ -308,6 +318,46 @@ plan allows two triggers in total. The page names its own cause; the notify trig
 counters and cannot say which moved, so the first panel below is the answer."""
 
 
+def existing_columns(key: str, dataset: str) -> set[str]:
+    """Every column name the dataset has actually received data for.
+
+    Honeycomb refuses to store a query naming a column it has never seen --
+    ``422: The provided input is invalid``, with no indication of which column.
+    Measured, not assumed: a HEATMAP over an existing column is accepted and the
+    same HEATMAP over an absent one is refused.
+
+    That makes column existence a precondition of provisioning a board, and it
+    bites hardest on exactly the case this tool exists for: a customer's
+    environment is empty until their gateway sends something, so on a fresh
+    environment every panel would be refused and the whole run would abort.
+    """
+    listed = api(key, "GET", f"/1/columns/{dataset}") or []
+    return {c.get("key_name") for c in listed if c.get("key_name")}
+
+
+def columns_used(spec: dict) -> set[str]:
+    """The columns a query spec names, across calculations and breakdowns."""
+    out = {c["column"] for c in spec.get("calculations", []) if c.get("column")}
+    out |= set(spec.get("breakdowns") or [])
+    return out
+
+
+def notify(recipient_id: str) -> dict:
+    """One entry in a trigger's ``recipients`` list.
+
+    An object, not the bare id. The API rejects a list of strings with
+    ``422: incorrect type for field`` and does not say which field, which is a
+    long way from the two minutes it takes to read the schema: a
+    TriggerNotificationRecipient is an object whose ``id`` names an existing
+    recipient.
+
+    A function rather than an inline dict at both call sites, because the two
+    sites are the found-it and created-it branches of the same decision and a fix
+    applied to one of them would look complete.
+    """
+    return {"id": recipient_id}
+
+
 def recipient_target(r: dict) -> str | None:
     """Where a recipient's address actually lives in the API response.
 
@@ -390,14 +440,14 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
         )
         if existing:
             print(f"recipient exists: {recipient}")
-            recipients = [existing["id"]]
+            recipients = [notify(existing["id"])]
         else:
             made = write("create recipient", recipient,
                          lambda: api(key, "POST", "/1/recipients",
                                      {"type": "email", "target": recipient}))
             if made:
                 print(f"recipient created: {recipient}")
-                recipients = [made["id"]]
+                recipients = [notify(made["id"])]
                 changed.append("recipient")
 
     have = api(key, "GET", f"/1/triggers/{dataset}") or []
@@ -446,7 +496,20 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
             "text_panel": {"content": BOARD_TEXT},
         }
     ]
-    for i, (name, desc, spec) in enumerate(board_queries()):
+    have = existing_columns(key, dataset)
+    panels_wanted = board_queries()
+    skipped = []
+    if have:
+        keep = []
+        for entry in panels_wanted:
+            missing = sorted(columns_used(entry[2]) - have)
+            if missing:
+                skipped.append((entry[0], missing))
+            else:
+                keep.append(entry)
+        panels_wanted = keep
+
+    for i, (name, desc, spec) in enumerate(panels_wanted):
         # Behind write(), not around it. A board panel needs a saved query and
         # an annotation to point at, and creating those is as much a write as
         # creating the board: they are named objects that persist in the
@@ -473,11 +536,15 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
                     "width": 6,
                     "height": 4,
                 },
+                # No "dataset" key. The API returns it on a GET and refuses it
+                # on a write -- "dataset is not allowed on query panels requests"
+                # -- so a board read back and written straight out again is
+                # rejected. The saved query already carries the dataset it was
+                # created against.
                 "query_panel": {
                     "query_id": q["id"],
                     "query_annotation_id": ann["id"],
                     "query_style": "combo",
-                    "dataset": dataset,
                 },
             }
         )
@@ -498,6 +565,15 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
     if made:
         print(f"board {verb.split()[0]}d: {made['links']['board_url']}")
         changed.append(BOARD_NAME)
+
+    if skipped:
+        print()
+        print("Panels left off the board, because their columns do not exist yet:")
+        for name, missing in skipped:
+            print(f"  - {name}: {', '.join(missing)}")
+        print("  A column appears the first time data is written to it, so these")
+        print("  become available once the gateway has exported once. Re-run then;")
+        print("  the board is updated in place and will pick them up.")
 
     if unverified:
         # Loud, itemised, and last, so it is the part still on screen. Saying
