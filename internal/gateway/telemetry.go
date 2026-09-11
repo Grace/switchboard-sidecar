@@ -591,6 +591,14 @@ type Event struct {
 	// plane through Ext, so an older control plane treats it as data rather than
 	// failing the whole event.
 	Usage tokenUsage `json:"-"`
+	// Requested is the model the caller asked for, as opposed to Model, which is
+	// the model sent upstream once a route was chosen.
+	//
+	// They differ in the case that matters: a request refused before routing has
+	// no Model, so without this nothing records what it wanted. They also differ
+	// legitimately in normal operation, because the caller names a policy alias
+	// and the policy resolves it to a provider's own model name.
+	Requested string `json:"-"`
 	// Tries is the per-attempt detail: one record per upstream call, in the
 	// order they were made.
 	//
@@ -628,6 +636,13 @@ func (e Event) wire() Event {
 	}
 	if e.Model != "" {
 		ext["model"] = e.Model
+	}
+	// Only where it differs from the model actually sent, which is the case the
+	// control plane cannot otherwise see: a request refused before routing, or a
+	// policy alias resolving to a different upstream name. Writing it on every
+	// event would repeat "model" on the large majority of them for nothing.
+	if e.Requested != "" && e.Requested != e.Model {
+		ext["requested_model"] = e.Requested
 	}
 	if e.Fault != "" {
 		ext["fault"] = e.Fault
@@ -1578,4 +1593,42 @@ func (t *Telemetry) postSpans(ctx context.Context, spans []any) {
 	if res.StatusCode != 200 || bytes.Contains(b, []byte("rejectedSpans")) {
 		t.m.ExportErrors.Add(1)
 	}
+}
+
+// routeHeader renders the attempts as one line for X-Switchboard-Route:
+//
+//	openai/gpt-4o-mini:503 rate_limited, anthropic/claude-sonnet-4:200
+//
+// Compact rather than JSON because it is a header, and ordered because the order
+// is the information: the last entry answered, and everything before it is why
+// the request took as long as it did.
+//
+// A status of 0 means the attempt never got one -- a transport failure or a
+// timeout -- and is rendered as "-" rather than as a number no provider sent.
+func (e Event) routeHeader() string {
+	if len(e.Tries) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, t := range e.Tries {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(t.Provider)
+		if t.Model != "" {
+			b.WriteString("/")
+			b.WriteString(t.Model)
+		}
+		b.WriteString(":")
+		if t.Status == 0 {
+			b.WriteString("-")
+		} else {
+			b.WriteString(strconv.Itoa(t.Status))
+		}
+		if t.Fault != "" {
+			b.WriteString(" ")
+			b.WriteString(t.Fault)
+		}
+	}
+	return b.String()
 }

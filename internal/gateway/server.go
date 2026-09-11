@@ -631,6 +631,18 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	// parse is still captured: "what did the caller actually send" is the whole
 	// question when a request is rejected as malformed.
 	capturedPrompt = json.RawMessage(b)
+	// What the caller asked for, read from the raw body and recorded before
+	// anything can reject it.
+	//
+	// Event.Model is the model sent upstream and is set once a route is chosen,
+	// so a refused request carried no model at all -- and the most common
+	// refusal is ParseChat rejecting the model itself, which happens on the next
+	// line. A savings view could therefore report that N requests never reached
+	// a provider and nothing about what any of them wanted, which is the
+	// difference between a number and something somebody can act on: a rising
+	// refusal rate is usually a policy that no longer matches what callers ask
+	// for, and the name they asked for is the evidence.
+	event.Requested = requestedModel(b)
 	c, e := ParseChat(b)
 	if e != nil {
 		fail(400, e.Error())
@@ -983,6 +995,20 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		// everything except the logs and the telemetry spool.
 		w.Header().Set("X-Switchboard-Provider", route.Provider)
 		w.Header().Set("X-Switchboard-Attempts", strconv.Itoa(event.Attempts))
+		// Which providers were tried, in order, and what each one said.
+		//
+		// The two headers above give the destination and a count, which between
+		// them cannot answer the question a caller actually has after a slow
+		// request came back from somewhere unexpected: what went wrong first.
+		// Until now that answer existed only in the telemetry spool, so a caller
+		// without access to it had to ask somebody who had.
+		//
+		// Rendered from Event.Tries, so it is a view of bookkeeping the gateway
+		// already keeps rather than a second record that could disagree with it.
+		// Bounded by max_attempts, which config validation pins to 1..3.
+		if r := event.routeHeader(); r != "" {
+			w.Header().Set("X-Switchboard-Route", r)
+		}
 
 		// Acceptance (HTTP 200) commits this generation. No body/stream error may fail over.
 		if c.Stream {
@@ -1560,4 +1586,28 @@ func (s *Server) replay(w http.ResponseWriter, e *idemEntry, id string, created 
 	w.Header().Set("X-Accel-Buffering", "no")
 	writeSSE(w, chunk(id, Route{}, normalized{Text: e.Text, Finish: e.Finish}, created))
 	fmt.Fprint(w, "data: [DONE]\n\n")
+}
+
+// requestedModel reads just the model field out of a request body.
+//
+// Tolerant on purpose: this runs before validation and its whole job is to
+// describe a request that may be about to be rejected, so a body ParseChat will
+// refuse must still yield whatever it said. A body that is not an object, or
+// carries no model, yields the empty string and nothing is recorded.
+//
+// The value is caller-controlled and goes into telemetry, so it is bounded.
+// Model names are short; anything longer is not a model name, and the truncated
+// prefix is still enough to recognise what was being asked for.
+func requestedModel(body []byte) string {
+	var peek struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &peek); err != nil {
+		return ""
+	}
+	const max = 128
+	if len(peek.Model) > max {
+		return peek.Model[:max]
+	}
+	return peek.Model
 }

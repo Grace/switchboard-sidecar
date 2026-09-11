@@ -5,6 +5,7 @@ package gateway
 import (
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -147,5 +148,126 @@ func TestASingleAttemptStillReportsItsCost(t *testing.T) {
 	if e.Tries[0].Usage != e.Usage {
 		t.Errorf("with one attempt the total and the attempt must agree: %+v vs %+v",
 			e.Tries[0].Usage, e.Usage)
+	}
+}
+
+// TestARefusedRequestRecordsWhatItAskedFor covers the gap that made a refusal
+// countable but not actionable.
+//
+// Event.Model is the model sent upstream and is set once a route is chosen, so a
+// request the policy refuses carried no model at all. The savings view could
+// report that N requests never reached a provider and nothing about what any of
+// them wanted -- and "a rising refusal rate" is only useful next to "they are
+// all asking for a model the policy dropped".
+func TestARefusedRequestRecordsWhatItAskedFor(t *testing.T) {
+	p := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the provider was called for a model the policy does not offer")
+	}))
+	defer p.Close()
+
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: p.URL, KeyEnv: "PROVIDER_KEY"}})
+	tel, err := NewTelemetry(Config{DataDir: t.TempDir(), ControlURL: "http://127.0.0.1:1", QueueSize: 16}, s.Metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	useTestTransport(tel.http)
+	s.Telemetry = tel
+
+	const asked = "a-model-no-policy-offers"
+	w := call(s, `{"model":"`+asked+`","messages":[{"role":"user","content":"hi"}]}`)
+	if w.Code < 400 {
+		t.Fatalf("expected a refusal, got %d %s", w.Code, w.Body)
+	}
+	t.Logf("refusal: %d %s", w.Code, strings.TrimSpace(w.Body.String()))
+
+	select {
+	case e := <-tel.queue:
+		if e.Attempts != 0 {
+			t.Errorf("Attempts = %d; a refused request reached a provider", e.Attempts)
+		}
+		if e.Model != "" {
+			t.Errorf("Model = %q; nothing was sent upstream, so there is no upstream model", e.Model)
+		}
+		if e.Requested != asked {
+			t.Errorf("Requested = %q, want %q -- without it the dashboard can count "+
+				"refusals and not say what they wanted", e.Requested, asked)
+		}
+		if got := e.wire().Ext["requested_model"]; got != asked {
+			t.Errorf("ext[requested_model] = %v, want %q; it has to reach the control "+
+				"plane or only the span has it", got, asked)
+		}
+	default:
+		t.Fatal("no event was emitted for a refused request")
+	}
+}
+
+// TestTheRouteHeaderNamesEveryAttempt covers the one thing a caller cannot learn
+// from the other headers.
+//
+// X-Switchboard-Provider says which provider answered and X-Switchboard-Attempts
+// says how many were made. Neither says what went wrong first, so a caller whose
+// request came back slowly from an unexpected provider had to ask somebody with
+// access to the telemetry spool.
+func TestTheRouteHeaderNamesEveryAttempt(t *testing.T) {
+	first := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, emptyByBudget)
+	}))
+	defer first.Close()
+	second := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"content":[{"type":"text","text":"rescued"}],"stop_reason":"end_turn"}`)
+	}))
+	defer second.Close()
+
+	s := testServer(t, map[string]ProviderConfig{
+		"openai":    {URL: first.URL, KeyEnv: "PROVIDER_KEY"},
+		"anthropic": {URL: second.URL, KeyEnv: "PROVIDER_KEY"},
+	})
+	w := call(s, chat)
+	if w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+
+	got := w.Header().Get("X-Switchboard-Route")
+	if got == "" {
+		t.Fatal("no X-Switchboard-Route on a request that failed over")
+	}
+	// Order is the information: the last entry answered, the ones before it are
+	// why the request took as long as it did.
+	if !strings.HasPrefix(got, "openai/") {
+		t.Errorf("route = %q; the first attempt must come first", got)
+	}
+	if !strings.Contains(got, "anthropic/") {
+		t.Errorf("route = %q; the provider that answered is missing", got)
+	}
+	if strings.Index(got, "openai/") > strings.Index(got, "anthropic/") {
+		t.Errorf("route = %q; attempts are out of order", got)
+	}
+	if n := strings.Count(got, ","); n != 1 {
+		t.Errorf("route = %q; want exactly two attempts", got)
+	}
+	// It has to agree with the count beside it, or the two headers describe
+	// different requests.
+	if a := w.Header().Get("X-Switchboard-Attempts"); a != "2" {
+		t.Errorf("X-Switchboard-Attempts = %q, want 2 alongside route %q", a, got)
+	}
+}
+
+// TestTheRouteHeaderOnAnOrdinaryRequest keeps the common case honest: one
+// attempt, one entry, and no comma implying a failover that did not happen.
+func TestTheRouteHeaderOnAnOrdinaryRequest(t *testing.T) {
+	p := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"choices":[{"index":0,"message":{"content":"hi"},"finish_reason":"stop"}],`+
+			`"usage":{"prompt_tokens":7,"completion_tokens":3}}`)
+	}))
+	defer p.Close()
+
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: p.URL, KeyEnv: "PROVIDER_KEY"}})
+	w := call(s, chat)
+	got := w.Header().Get("X-Switchboard-Route")
+	if strings.Contains(got, ",") {
+		t.Errorf("route = %q on a single-attempt request", got)
+	}
+	if !strings.Contains(got, ":200") {
+		t.Errorf("route = %q; want the upstream status", got)
 	}
 }
