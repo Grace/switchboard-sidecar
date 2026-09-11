@@ -427,3 +427,76 @@ func TestTheAttemptRecordReachesTheControlPlane(t *testing.T) {
 		t.Errorf("attempt 1 fault = %v, want empty_completion", one["fault"])
 	}
 }
+
+// TestAStreamingEmptyCompletionStillReportsItsCost is the streaming half of a
+// defect that was only fixed on the non-streaming path.
+//
+// A reasoning model can burn its whole budget and emit no text. Non-streaming,
+// that is detected, recorded with its cost and failed over. Streaming, the
+// branch that detects it continued to the next route *before* reaching
+// recordUsage -- so the attempt recorded a clean 200 with no fault and no
+// tokens. The stream had already stated its totals and stream() had captured
+// them; the branch threw them away.
+//
+// The consequence is worse than a missing number. The tokens were billed, so
+// the request really did cost them, and with the attempt reporting zero the
+// cost silently attaches to whichever provider answered. A savings view then
+// shows the wrong provider as expensive.
+//
+// This path is the one README's own example request uses.
+func TestAStreamingEmptyCompletionStillReportsItsCost(t *testing.T) {
+	// Finishes on length with no content and states its usage, which is what a
+	// reasoning model that spent its budget on hidden reasoning looks like.
+	const emptyStream = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]," +
+		"\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1024," +
+		"\"completion_tokens_details\":{\"reasoning_tokens\":1024}}}\n\ndata: [DONE]\n\n"
+
+	first := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, emptyStream)
+	}))
+	defer first.Close()
+	second := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\","+
+			"\"delta\":{\"type\":\"text_delta\",\"text\":\"rescued\"}}\n\n"+
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"+
+			"\"usage\":{\"input_tokens\":41,\"output_tokens\":12}}\n\n"+
+			"data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer second.Close()
+
+	s := testServer(t, map[string]ProviderConfig{
+		"openai":    {URL: first.URL, KeyEnv: "PROVIDER_KEY"},
+		"anthropic": {URL: second.URL, KeyEnv: "PROVIDER_KEY"},
+	})
+	e := emitted(t, s, `{"model":"preferred","stream":true,"max_tokens":1024,`+
+		`"messages":[{"role":"user","content":"hi"}]}`)
+
+	if e.Attempts != 2 {
+		t.Fatalf("Attempts = %d, want 2; the fixture no longer fails over", e.Attempts)
+	}
+	if len(e.Tries) != 2 {
+		t.Fatalf("len(Tries) = %d, want 2", len(e.Tries))
+	}
+
+	// The attempt that produced nothing was billed, and has to say so.
+	one := e.Tries[0]
+	if one.Usage.Input == 0 && one.Usage.Output == 0 {
+		t.Errorf("attempt 1 recorded no tokens at all. The stream stated 9 in and " +
+			"1024 out before producing nothing, and those were billed; reporting " +
+			"zero here attaches the cost to whichever provider answered")
+	}
+	if one.Usage.Input != 9 {
+		t.Errorf("attempt 1 input tokens = %d, want 9", one.Usage.Input)
+	}
+	if one.Fault != "empty_completion" {
+		t.Errorf("attempt 1 fault = %q, want empty_completion; without it a route "+
+			"listing shows two 200s and no reason the request moved on", one.Fault)
+	}
+
+	// And the total is the sum, as on the non-streaming path.
+	if e.Usage.Input != 9+41 {
+		t.Errorf("Usage.Input = %d, want %d", e.Usage.Input, 9+41)
+	}
+}

@@ -1032,6 +1032,17 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				s.circuits[route.Provider].result(false)
 				s.budgets.observe(route.Provider, route.Model, c.MaxTokens, false)
 				empties = append(empties, emptyRoute{provider: route.Provider, model: route.Model, budget: c.MaxTokens})
+				// The same accounting the non-streaming empty completion does,
+				// and it was missing here. This branch continues to the next
+				// route, so it never reaches the recordUsage eight lines below
+				// -- and stream() had already captured the totals the provider
+				// stated, so they were not unavailable. They were discarded.
+				//
+				// The attempt therefore recorded a clean 200 with no fault and
+				// no tokens: the waste invisible, and its cost silently folded
+				// into whichever provider answered.
+				event.recordUsage(streamed.usage)
+				event.endTry(res.StatusCode, "empty_completion", time.Now().UnixNano())
 				s.Metrics.EmptyCompletion.Add(1)
 				slog.Warn("provider produced no output within the token budget", "request_id", id,
 					"provider", route.Provider, "model", route.Model, "max_tokens", c.MaxTokens)
