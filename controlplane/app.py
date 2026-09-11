@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import pathlib
 import re
 import time
 import uuid
@@ -13,7 +14,7 @@ from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from psycopg.rows import dict_row
 from psycopg.conninfo import conninfo_to_dict
@@ -361,6 +362,91 @@ def create_app(pool=None, seed=None, key_id=None):
             },
             "failed_over_requests": total("failed_over"),
         }
+
+    @app.get("/v1/requests")
+    def requests_list(hours: int = 24, limit: int = 2000, s=Depends(session, scope="function")):
+        """One row per request, projected to the figures a chart can plot.
+
+        /v1/savings aggregates by route, which answers where the spend went and
+        cannot answer which individual requests were unusual. That is a
+        different question and needs the rows, not the totals: an average hides
+        the request that took nine seconds, and the whole reason to keep
+        per-request telemetry is to be able to find it.
+
+        Projected in SQL rather than returning the event blobs. A chart needs
+        eight numbers per request and the blob carries far more, most of it
+        repeated on every row.
+
+        Same read set as /v1/savings and /v1/telemetry, and the same reasoning:
+        this is those events with the columns picked out, so a reader who can
+        see them can already compute this by hand.
+
+        No prompts and no completions. Captured content never reaches the
+        control plane at all -- it stays on the gateway's disk -- and nothing
+        here would change that, but the projection names its columns explicitly
+        rather than selecting whatever the event happens to hold, so a new field
+        on the gateway cannot arrive here unnoticed.
+        """
+        db, p = s
+        require(p, "admin", "publisher", "viewer")
+        # Both bounded, for the reason savings() states: this reads a table that
+        # grows with traffic, and an unbounded query is one somebody eventually
+        # issues by accident.
+        hours = max(1, min(hours, 24 * 31))
+        limit = max(1, min(limit, 5000))
+
+        rows = db.execute(
+            """
+            SELECT
+              extract(epoch from received_at)                               AS at,
+              coalesce(event->>'provider','')                               AS provider,
+              coalesce(event->'ext'->>'model','')                           AS model,
+              (event->>'status')::int                                       AS status,
+              (event->>'attempts')::int                                     AS attempts,
+              ((event->>'end_ns')::bigint - (event->>'start_ns')::bigint)/1000000
+                                                                            AS duration_ms,
+              coalesce((event->'ext'->>'gen_ai.usage.input_tokens')::bigint, 0)  AS input_tokens,
+              coalesce((event->'ext'->>'gen_ai.usage.output_tokens')::bigint, 0) AS output_tokens,
+              coalesce((event->'ext'->>'gen_ai.usage.cache_read.input_tokens')::bigint, 0)
+                                                                            AS cache_read,
+              coalesce(event->'ext'->>'fault','')                           AS fault,
+              coalesce(event->'ext'->>'requested_model','')                  AS requested_model
+            FROM telemetry
+            WHERE received_at > now() - make_interval(hours => %s)
+            ORDER BY received_at DESC
+            LIMIT %s
+            """,
+            (hours, limit)).fetchall()
+
+        return {
+            "window_hours": hours,
+            "limit": limit,
+            # So a page can say it is showing a sample rather than implying it
+            # is showing the population. A chart that silently truncates is a
+            # chart that lies by omission.
+            "truncated": len(rows) >= limit,
+            "rows": [dict(r) for r in rows],
+        }
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard():
+        """The savings dashboard, served from the API's own origin.
+
+        Same origin on purpose. Every read here authenticates with a bearer
+        token, and a page served from anywhere else turns each call into a CORS
+        preflight -- which ends with a permissive CORS policy bolted onto an
+        authenticated API, to make a convenience work.
+
+        The document carries no data and no credential. It asks the reader for
+        their own token, keeps it in sessionStorage and sends it as a header, so
+        there is no cookie and therefore no CSRF surface. Unauthenticated
+        because it is a shell: everything of value behind it still needs the
+        token.
+        """
+        # Read per request rather than cached at import, so editing the page
+        # during local development does not need a restart. It is one small
+        # file off local disk on a route nobody polls.
+        return HTMLResponse((pathlib.Path(__file__).parent / "dashboard.html").read_text())
 
     @app.post("/v1/health")
     def health_sync(body: HealthSync, s=Depends(session, scope="function")):

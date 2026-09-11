@@ -1,0 +1,450 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchboard — where the tokens went</title>
+<link rel="icon" href="data:,">
+
+<style>
+/* Ink on paper, with one accent. This is a page somebody screenshots into a
+   deck and reads next to an invoice, so it is typeset rather than styled: no
+   gradients, no cards for the sake of cards, and colour reserved for the two
+   things that carry meaning -- which provider a box belongs to, and whether a
+   request went wrong. */
+:root {
+  color-scheme: light;
+  --bg: #f7f7f5;
+  --panel: #fff;
+  --ink: #17181a;
+  --dim: #5d646c;
+  --faint: #8d949c;
+  --line: #e0e2e5;
+  --accent: #185e54;
+  --warn: #9a4b1f;
+  --bad: #9e2f26;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  /* One hue per provider, used in the treemap and nowhere else, so a colour on
+     this page always means the same thing. */
+  --openai: #2f6f62;
+  --anthropic: #8a5a2b;
+  --gemini: #35608c;
+  --bedrock: #6b4a80;
+  --other: #6c7076;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #131517; --panel: #1b1e21; --ink: #e9ebed; --dim: #a6adb4;
+    --faint: #767d85; --line: #2a2e33; --accent: #5fbfae; --warn: #d99457; --bad: #ec8279;
+    --openai: #5fbfae; --anthropic: #d4a06a; --gemini: #7aa9d6; --bedrock: #ab8ac4; --other: #8a9098;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 2.5rem 1.5rem 5rem; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 64rem; margin: 0 auto; }
+h1 { margin: 0 0 .3rem; font-size: 1.6rem; letter-spacing: -.015em; }
+.sub { margin: 0 0 1.75rem; color: var(--dim); max-width: 44rem; }
+code { font-family: var(--mono); font-size: .9em; }
+
+/* token gate */
+.gate { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.25rem; max-width: 34rem; }
+.gate label { display: block; font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); margin-bottom: .35rem; }
+.gate .field { display: flex; gap: .4rem; }
+.gate .field input { flex: 1; min-width: 0; }
+.gate .field button { font-size: .8rem; padding: .45rem .7rem; color: var(--dim); }
+.gate input { width: 100%; font: inherit; font-family: var(--mono); font-size: .85rem; padding: .5rem .6rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+.gate p { font-size: .82rem; color: var(--dim); margin: .75rem 0 0; }
+button { font: inherit; padding: .45rem .9rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:hover { border-color: var(--accent); }
+
+.controls { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-end; margin-bottom: 1.25rem; }
+.controls label { display: flex; flex-direction: column; gap: .3rem; font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); }
+select { font: inherit; padding: .4rem .55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+
+.figures { display: flex; flex-wrap: wrap; gap: 2.25rem; padding: 1.1rem 1.25rem; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 1.25rem; }
+.figures dt { font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); margin-bottom: .2rem; }
+.figures dd { margin: 0; font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+.figures .unit { font-size: .78rem; color: var(--faint); margin-left: .2rem; }
+
+.treemap { position: relative; width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.cell { position: absolute; overflow: hidden; border-right: 1px solid var(--panel); border-bottom: 1px solid var(--panel); padding: .4rem .5rem; color: #fff; }
+.cell .k { font: 600 .74rem/1.2 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+.cell .v { font: .7rem/1.3 var(--mono); opacity: .85; }
+.legend { display: flex; flex-wrap: wrap; gap: 1rem; margin: .75rem 0 0; font-size: .78rem; color: var(--dim); }
+.legend span { display: inline-flex; align-items: center; gap: .35rem; }
+.swatch { width: .7rem; height: .7rem; border-radius: 2px; display: inline-block; }
+
+.note { font-size: .8rem; color: var(--faint); margin: 1rem 0 0; max-width: 46rem; }
+.note strong { color: var(--dim); font-weight: 600; }
+.why { margin-top: 1.25rem; }
+table.why { max-width: 46rem; margin-top: .5rem; }
+table.why td { font-size: .82rem; }
+.dim { color: var(--faint); }
+.empty { padding: 2.5rem 1.25rem; text-align: center; color: var(--dim); }
+.err { color: var(--bad); }
+table { width: 100%; border-collapse: collapse; font-size: .84rem; margin-top: 1.5rem; }
+th { text-align: left; font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); font-weight: 600; padding: 0 .8rem .4rem 0; border-bottom: 1px solid var(--line); }
+td { padding: .4rem .8rem .4rem 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+td.n { text-align: right; }
+tr:last-child td { border-bottom: 0; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+
+<main id="app"></main>
+
+<script>
+// No framework and no CDN. The control plane has no build step, this page is
+// served from the API's own origin so it must not pull a third party in, and a
+// squarified treemap is forty lines. A dependency here would be a dependency in
+// the deployment.
+
+const $ = (h) => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstElementChild }
+const fmt = (n) => n == null ? '—' : n.toLocaleString()
+const PROVIDERS = ['openai', 'anthropic', 'gemini', 'bedrock']
+const hue = (p) => `var(--${PROVIDERS.includes(p) ? p : 'other'})`
+
+// A row with no provider is not a gap in the data. It is a request the gateway
+// finished without calling anyone: rejected by the signed policy, refused for
+// auth, turned away by the rate limiter, or served from the idempotency store.
+// Labelling it "(none)" made a third of this page unreadable, because the word
+// describes the missing field rather than the thing that happened.
+const UNROUTED = 'never reached a provider'
+const NOPROVIDER = 'unrouted'
+const label = (r) => (r.provider ? r.model || '(no model)' : UNROUTED)
+let unroutedWhy = '' // set once the rows are read, for the treemap tooltip
+const group = (r) => r.provider || NOPROVIDER
+
+const METRICS = [
+  ['input_tokens', 'input tokens'],
+  ['output_tokens', 'output tokens'],
+  ['cache_read', 'tokens read from cache'],
+  ['cache_write', 'tokens written to cache'],
+  ['requests', 'requests'],
+]
+
+let token = sessionStorage.getItem('switchboard.token') || ''
+let hours = 24
+let metric = 'input_tokens'
+
+async function api(path) {
+  const r = await fetch(path, { headers: { Authorization: 'Bearer ' + token } })
+  if (r.status === 401) throw new Error('That token was not accepted.')
+  if (r.status === 403) throw new Error('That token is valid but lacks the viewer role.')
+  if (!r.ok) throw new Error('The API returned ' + r.status + '.')
+  return r.json()
+}
+
+/**
+ * Squarified treemap (Bruls, Huizing, van Wijk). Lays out one row at a time,
+ * adding rectangles while the worst aspect ratio keeps improving, so boxes stay
+ * close to square and therefore comparable by area -- which is the only reason
+ * to use a treemap rather than a bar chart.
+ */
+function squarify(items, x, y, w, h) {
+  const out = []
+  const total = items.reduce((t, i) => t + i.value, 0)
+  if (total <= 0) return out
+  let rest = items.map((i) => ({ ...i, area: (i.value / total) * w * h }))
+
+  const worst = (row, len) => {
+    const s = row.reduce((t, r) => t + r.area, 0)
+    const mx = Math.max(...row.map((r) => r.area))
+    const mn = Math.min(...row.map((r) => r.area))
+    return Math.max((len * len * mx) / (s * s), (s * s) / (len * len * mn))
+  }
+
+  while (rest.length) {
+    const vertical = w >= h
+    const len = vertical ? h : w
+    let row = [rest[0]]
+    while (row.length < rest.length) {
+      const next = row.concat([rest[row.length]])
+      if (worst(next, len) > worst(row, len)) break
+      row = next
+    }
+    const s = row.reduce((t, r) => t + r.area, 0)
+    const thick = s / len
+    let at = vertical ? y : x
+    for (const r of row) {
+      const span = r.area / thick
+      out.push(vertical
+        ? { ...r, x, y: at, w: thick, h: span }
+        : { ...r, x: at, y, w: span, h: thick })
+      at += span
+    }
+    if (vertical) { x += thick; w -= thick } else { y += thick; h -= thick }
+    rest = rest.slice(row.length)
+  }
+  return out
+}
+
+function renderTreemap(routes, key) {
+  const host = $(`<div class="treemap" style="height:420px"></div>`)
+  const items = routes
+    .map((r) => ({ provider: group(r), model: label(r), value: Number(r[key]) || 0 }))
+    .filter((r) => r.value > 0)
+    .sort((a, b) => b.value - a.value)
+
+  if (!items.length) {
+    host.append($(`<p class="empty">No ${METRICS.find((m) => m[0] === key)[1]} in this window.</p>`))
+    return host
+  }
+
+  // Laid out in a unit square and positioned with percentages, so nothing has
+  // to be measured. The first version measured clientWidth inside a
+  // requestAnimationFrame and drew nothing at all when the tab was not in front,
+  // because Chrome throttles rAF in a background tab -- a dashboard somebody
+  // leaves open on a second monitor is exactly the case that broke. Percentages
+  // also make it responsive for free.
+  const total = items.reduce((t, i) => t + i.value, 0)
+  for (const c of squarify(items, 0, 0, 1, 1)) {
+    const pct = ((c.value / total) * 100).toFixed(1)
+    const why = c.provider === NOPROVIDER && unroutedWhy ? '&#10;' + unroutedWhy : ''
+    const cell = $(`<div class="cell" title="${c.provider} / ${c.model}&#10;${fmt(c.value)} (${pct}%)${why}">
+      <span class="k">${c.model}</span>
+      <span class="v">${fmt(c.value)} · ${pct}%</span>
+    </div>`)
+    Object.assign(cell.style, {
+      left: (c.x * 100) + '%', top: (c.y * 100) + '%',
+      width: (c.w * 100) + '%', height: (c.h * 100) + '%',
+    })
+    cell.style.background = hue(c.provider)
+    // A sliver cannot be lettered; the tooltip still carries it.
+    if (c.h * 420 < 30 || c.w < 0.06) cell.innerHTML = ''
+    host.append(cell)
+  }
+  return host
+}
+
+// Why the gateway finished a request without calling anyone.
+//
+// The treemap can say how many, and how many is not actionable. This says what
+// they were: the status the caller got, glossed in words, and the model names
+// they asked for. A policy that has drifted from what callers want shows up here
+// as one model name with a large count.
+const WHY = {
+  400: 'the request was rejected before routing — most often a model the signed policy does not offer',
+  401: 'authentication failed',
+  403: 'authenticated, but not permitted',
+  409: 'an idempotency key was in use, or its original outcome is unknown',
+  413: 'the body was too large to read',
+  422: 'an idempotency key was reused with a different body',
+  429: 'turned away by the rate or concurrency limit',
+  503: 'no valid routing policy, or the gateway was draining',
+}
+
+/**
+ * The cause, as a clause that can finish the sentence "never reached a provider".
+ *
+ * Derived from the rows rather than asserted, and it says how much of the total
+ * it accounts for whenever that is not all of it -- a headline that names one
+ * cause for a mixed population is the kind of summary that reads as a finding
+ * and is a guess.
+ */
+function becauseOf(byStatus, total) {
+  const ranked = [...byStatus.entries()].sort((a, b) => b[1] - a[1])
+  if (!ranked.length) return ''
+  const [status, n] = ranked[0]
+  const gloss = WHY[status] || `the gateway answered ${status}`
+  if (ranked.length === 1) return `all of them because ${gloss}`
+  return `mostly because ${gloss} — ${fmt(n)} of ${fmt(total)}, with ${ranked.length - 1}
+          other ${ranked.length === 2 ? 'cause' : 'causes'} below`
+}
+
+function explainUnrouted(route, detail) {
+  const rows = (detail?.rows || []).filter((r) => !r.provider)
+  const box = $(`<div class="why"></div>`)
+
+  if (!rows.length) {
+    box.append($(`<p class="note"><strong>${fmt(route.requests)} requests ${UNROUTED}.</strong>
+      No per-request rows in this window to say why.</p>`))
+    return box
+  }
+
+  const byStatus = new Map()
+  const byModel = new Map()
+  for (const r of rows) {
+    byStatus.set(r.status, (byStatus.get(r.status) || 0) + 1)
+    const m = r.requested_model || '(not recorded)'
+    byModel.set(m, (byModel.get(m) || 0) + 1)
+  }
+  const desc = (m) => [...m.entries()].sort((a, b) => b[1] - a[1])
+
+  // The model asked for, but only when it is actually known and actually
+  // concentrated. "Most often asking for X" where X is a fifth of the rows is
+  // not most often.
+  const named = desc(byModel).filter(([m]) => m !== '(not recorded)')
+  const [topModel, topN] = named[0] || []
+  const share = topN / rows.length
+  const asking = topModel && share >= 0.3
+    ? ` Most were asking for <code>${topModel}</code> — ${fmt(topN)} of ${fmt(rows.length)}.`
+    : topModel
+      ? ` The most common request was <code>${topModel}</code>, ${fmt(topN)} of ${fmt(rows.length)}.`
+      : ''
+
+  box.append($(`<p class="note"><strong>${fmt(route.requests)} requests ${UNROUTED},
+    ${becauseOf(byStatus, rows.length)}.</strong>${asking}
+    The gateway finished them without calling anyone, so they cost no tokens — which is
+    why they vanish when you size by a token metric and dominate when you size by
+    requests. A rising share here is usually a signed policy that no longer matches what
+    callers are asking for.</p>`))
+
+  box.append($(`<table class="why">
+    <thead><tr><th>Status</th><th>What it means</th><th class="n">Requests</th></tr></thead>
+    <tbody>${desc(byStatus).map(([st, n]) => `<tr>
+      <td><code>${st}</code></td>
+      <td>${WHY[st] || 'no gloss for this status yet'}</td>
+      <td class="n">${fmt(n)}</td></tr>`).join('')}</tbody></table>`))
+
+  box.append($(`<table class="why">
+    <thead><tr><th>They asked for</th><th class="n">Requests</th></tr></thead>
+    <tbody>${desc(byModel).map(([m, n]) => `<tr>
+      <td>${m === '(not recorded)' ? '<span class="dim">not recorded — this gateway predates requested_model</span>' : `<code>${m}</code>`}</td>
+      <td class="n">${fmt(n)}</td></tr>`).join('')}</tbody></table>`))
+
+  if (detail.truncated) {
+    box.append($(`<p class="note">Rows capped at ${fmt(detail.limit)}, so this breakdown is a
+      sample of the window rather than all of it.</p>`))
+  }
+  return box
+}
+
+function renderGate(message) {
+  const app = document.getElementById('app')
+  app.innerHTML = ''
+  app.append($(`<h1>Where the tokens went</h1>`))
+  app.append($(`<p class="sub">Token spend by provider and model, read live from this control
+    plane. It needs a token with the viewer role or better — the same one you would use
+    against <code>/v1/savings</code>.</p>`))
+  const gate = $(`<form class="gate">
+    <label for="tok">API token</label>
+    <div class="field">
+      <input id="tok" type="password" autocomplete="off" spellcheck="false"
+             placeholder="paste a token with the viewer role or better">
+      <button type="button" id="reveal" aria-label="Show the token">show</button>
+    </div>
+    <p>Any principal that can read <code>/v1/savings</code> will do: viewer,
+       publisher or admin. Running the local dev stack? It is
+       <code>BOOTSTRAP_ADMIN_TOKEN</code> in <code>.dev/env</code>, which
+       <code>scripts/devstack.py</code> printed when it provisioned the tenant.</p>
+    <p>Held in this tab only, in <code>sessionStorage</code> — so another tab will ask
+       again, and closing this one forgets it. Sent as a bearer header, never written to
+       a cookie, so this page has no CSRF surface, and never sent anywhere but this
+       origin.</p>
+    ${message ? `<p class="err">${message}</p>` : ''}
+    <p><button class="primary" type="submit">Show me</button></p>
+  </form>`)
+  // Masked by default, because this is a page somebody screen-shares. Revealable
+  // because a masked field gives no feedback that a paste landed, which reads as
+  // the field being broken rather than as the token being hidden.
+  gate.querySelector('#reveal').addEventListener('click', (e) => {
+    const f = gate.querySelector('#tok')
+    const shown = f.type === 'text'
+    f.type = shown ? 'password' : 'text'
+    e.target.textContent = shown ? 'show' : 'hide'
+    e.target.setAttribute('aria-label', shown ? 'Show the token' : 'Hide the token')
+  })
+  gate.addEventListener('submit', (e) => {
+    e.preventDefault()
+    token = gate.querySelector('#tok').value.trim()
+    sessionStorage.setItem('switchboard.token', token)
+    load()
+  })
+  app.append(gate)
+}
+
+async function load() {
+  const app = document.getElementById('app')
+  app.innerHTML = '<p class="empty">Reading…</p>'
+  let savings, detail
+  try {
+    // Two reads, because they answer different questions: savings aggregates by
+    // route, and the rows are what explain a route that is not one.
+    ;[savings, detail] = await Promise.all([
+      api(`/v1/savings?hours=${hours}`),
+      api(`/v1/requests?hours=${hours}&limit=5000`),
+    ])
+  } catch (e) {
+    renderGate(e.message)
+    return
+  }
+
+  app.innerHTML = ''
+  app.append($(`<h1>Where the tokens went</h1>`))
+  app.append($(`<p class="sub">Every figure below is read from this control plane's own
+    telemetry over the window you choose. Tokens, never money: this service has no price
+    table, and rates are per contract — multiply by your own.</p>`))
+
+  const controls = $(`<div class="controls"></div>`)
+  const win = $(`<label>Window<select>${[1, 6, 24, 24 * 7, 24 * 30]
+    .map((h) => `<option value="${h}"${h === hours ? ' selected' : ''}>${h <= 24 ? h + (h === 1 ? ' hour' : ' hours') : h / 24 + ' days'}</option>`).join('')}</select></label>`)
+  win.querySelector('select').addEventListener('change', (e) => { hours = +e.target.value; load() })
+  const met = $(`<label>Size boxes by<select>${METRICS
+    .map(([k, l]) => `<option value="${k}"${k === metric ? ' selected' : ''}>${l}</option>`).join('')}</select></label>`)
+  met.querySelector('select').addEventListener('change', (e) => { metric = e.target.value; draw() })
+  const out = $(`<button type="button">Forget my token</button>`)
+  out.addEventListener('click', () => { sessionStorage.removeItem('switchboard.token'); token = ''; renderGate() })
+  controls.append(win, met, out)
+  app.append(controls)
+
+  const t = savings.tokens
+  app.append($(`<dl class="figures">
+    <div><dt>Requests</dt><dd>${fmt(savings.requests)}</dd></div>
+    <div><dt>Input</dt><dd>${fmt(t.input)}<span class="unit">tokens</span></dd></div>
+    <div><dt>Output</dt><dd>${fmt(t.output)}<span class="unit">tokens</span></dd></div>
+    <div><dt>Read from cache</dt><dd>${fmt(t.cache_read)}<span class="unit">tokens</span></dd></div>
+    <div><dt>Failed over</dt><dd>${fmt(savings.failed_over_requests)}<span class="unit">requests</span></dd></div>
+    <div><dt>Served from replay</dt><dd>${fmt(savings.avoided.replayed_requests)}<span class="unit">requests</span></dd></div>
+  </dl>`))
+
+  // Plain-text version of the cause, for the treemap tooltip. Computed once
+  // from the same rows the breakdown below uses, so the box and the table
+  // cannot give different reasons.
+  {
+    const nr = (detail?.rows || []).filter((r) => !r.provider)
+    const counts = new Map()
+    for (const r of nr) counts.set(r.status, (counts.get(r.status) || 0) + 1)
+    const top = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]
+    unroutedWhy = top ? `${WHY[top[0]] || 'status ' + top[0]}` : ''
+  }
+
+  const slot = $(`<div></div>`)
+  app.append(slot)
+  function draw() {
+    slot.innerHTML = ''
+    slot.append(renderTreemap(savings.routes, metric))
+    const seen = [...new Set(savings.routes.map(group))]
+    slot.append($(`<div class="legend">${seen
+      .map((p) => `<span><i class="swatch" style="background:${hue(p)}"></i>${p}</span>`).join('')}</div>`))
+    slot.append($(`<p class="note"><strong>Area is ${METRICS.find((m) => m[0] === metric)[1]}, and only that.</strong>
+      The token kinds are deliberately not summed: a token read from cache and a token
+      generated differ by an order of magnitude in price, so one combined area would be a
+      number this service cannot produce. Switch the selector to compare.</p>`))
+    const unrouted = savings.routes.find((r) => !r.provider)
+    if (unrouted) slot.append(explainUnrouted(unrouted, detail))
+  }
+  draw()
+
+  if (savings.routes.length) {
+    const rows = [...savings.routes].sort((a, b) => (b[metric] || 0) - (a[metric] || 0))
+    app.append($(`<table>
+      <thead><tr><th>Provider</th><th>Model</th><th class="n">Requests</th><th class="n">Input</th>
+        <th class="n">Output</th><th class="n">Cache read</th><th class="n">Failed over</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr>
+        <td>${r.provider || '—'}</td><td>${r.provider ? `<code>${r.model}</code>` : UNROUTED}</td>
+        <td class="n">${fmt(r.requests)}</td><td class="n">${fmt(r.input_tokens)}</td>
+        <td class="n">${fmt(r.output_tokens)}</td><td class="n">${fmt(r.cache_read)}</td>
+        <td class="n">${fmt(r.failed_over)}</td></tr>`).join('')}</tbody></table>`))
+  }
+
+  const faults = Object.entries(savings.faults || {}).filter(([k]) => k)
+  app.append($(`<p class="note">Window: last ${savings.window_hours} hours.
+    ${savings.requests === 0 ? '<strong>No requests in it</strong> — an empty page here means nothing was sent, not that nothing was recorded.' : ''}
+    ${faults.length ? 'Faults seen: ' + faults.map(([k, n]) => `<code>${k}</code> ×${n}`).join(', ') + '.' : ''}</p>`))
+}
+
+token ? load() : renderGate()
+</script>
