@@ -1,0 +1,390 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchboard — did the model change under you?</title>
+<link rel="icon" href="data:,">
+
+<style>
+/* The same paper and ink as the savings dashboard, and the same rule about
+   colour, restated for this page: here a colour means one served model within a
+   window, and a hollow box means the provider did not say which model served. */
+:root {
+  color-scheme: light;
+  --bg: #f7f7f5; --panel: #fff; --ink: #17181a; --dim: #5d646c; --faint: #8d949c;
+  --line: #e0e2e5; --accent: #185e54; --warn: #9a4b1f; --bad: #9e2f26;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --s1: #2f6f62; --s2: #8a5a2b; --s3: #35608c; --s4: #6b4a80; --s5: #6c7076;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #131517; --panel: #1b1e21; --ink: #e9ebed; --dim: #a6adb4;
+    --faint: #767d85; --line: #2a2e33; --accent: #5fbfae; --warn: #d99457; --bad: #ec8279;
+    --s1: #5fbfae; --s2: #d4a06a; --s3: #7aa9d6; --s4: #ab8ac4; --s5: #8a9098;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 2.5rem 1.5rem 5rem; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 64rem; margin: 0 auto; }
+h1 { margin: 0 0 .3rem; font-size: 1.6rem; letter-spacing: -.015em; }
+h2 { margin: 2.25rem 0 .35rem; font-size: 1.05rem; }
+.sub { margin: 0 0 1.75rem; color: var(--dim); max-width: 44rem; }
+code { font-family: var(--mono); font-size: .9em; }
+a { color: var(--accent); }
+
+.gate { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.25rem; max-width: 34rem; }
+.gate label { display: block; font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); margin-bottom: .35rem; }
+.gate input { width: 100%; font: inherit; font-family: var(--mono); font-size: .85rem; padding: .5rem .6rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+.gate p { font-size: .82rem; color: var(--dim); margin: .75rem 0 0; }
+button { font: inherit; padding: .45rem .9rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.controls { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-end; margin-bottom: 1.25rem; }
+.controls label { display: flex; flex-direction: column; gap: .3rem; font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); }
+select { font: inherit; padding: .4rem .55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.1rem; }
+.axis { display: flex; justify-content: space-between; font: .7rem/1 var(--mono); color: var(--faint); margin: .35rem 0 0; }
+
+/* Panel A: one strip per route model, a box per bucket. */
+.route { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem 1rem; padding: .55rem 0; border-bottom: 1px solid var(--line); }
+.route:last-of-type { border-bottom: 0; }
+.route .name { flex: 0 0 13rem; min-width: 0; font: .8rem/1.3 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.strip { position: relative; flex: 1 1 20rem; height: 1.6rem; background: var(--bg); border-radius: 4px; }
+.seg { position: absolute; top: 0; bottom: 0; display: flex; flex-direction: column; }
+.seg i { display: block; min-height: 1px; }
+.hollow { background: transparent !important; box-shadow: inset 0 0 0 1px var(--faint); }
+
+/* Panel B: stacked shares per bucket, with policy versions as rules. */
+.mix { position: relative; height: 180px; background: var(--bg); border-radius: 4px; }
+.col { position: absolute; bottom: 0; top: 0; display: flex; flex-direction: column-reverse; }
+.col i { display: block; }
+.rule { position: absolute; top: -1.1rem; bottom: 0; border-left: 1px solid var(--faint); }
+.rule span { position: absolute; top: 0; left: .25rem; font: .68rem/1 var(--mono); color: var(--dim); white-space: nowrap; }
+.sim { position: absolute; top: 0; bottom: 0; border-left: 2px dashed var(--ink); }
+.health { position: relative; height: 10px; margin-top: .35rem; background: var(--bg); border-radius: 3px; }
+.health i { position: absolute; bottom: 0; }
+
+.legend { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin: .75rem 0 0; font-size: .78rem; color: var(--dim); }
+.legend span { display: inline-flex; align-items: center; gap: .35rem; }
+.swatch { width: .7rem; height: .7rem; border-radius: 2px; display: inline-block; }
+.chip { display: inline-block; font: 600 .66rem/1.4 var(--mono); letter-spacing: .04em; text-transform: uppercase; padding: 0 .35rem; border: 1px solid var(--ink); border-radius: 3px; }
+.chip.observed { border-color: var(--faint); color: var(--dim); }
+.note { font-size: .8rem; color: var(--faint); margin: .9rem 0 0; max-width: 46rem; }
+.note strong { color: var(--dim); font-weight: 600; }
+.empty { padding: 1.5rem 0; text-align: center; color: var(--dim); }
+.err { color: var(--bad); }
+table { width: 100%; border-collapse: collapse; font-size: .84rem; margin-top: 1rem; }
+th { text-align: left; font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); font-weight: 600; padding: 0 .8rem .4rem 0; border-bottom: 1px solid var(--line); }
+td { padding: .4rem .8rem .4rem 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+.wide { overflow-x: auto; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 40rem) { .route .name { flex-basis: 100%; } }
+</style>
+
+<main id="app"></main>
+
+<script>
+// No framework and no CDN, for the reasons dashboard.html gives. Every figure is
+// read from /v1/series and /v1/annotations on this origin.
+
+const $ = (h) => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstElementChild }
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+const fmt = (n) => n == null ? '—' : Number(n).toLocaleString()
+const NOT_STATED = null
+
+let token = sessionStorage.getItem('switchboard.token') || ''
+let hours = 1
+
+async function api(path, optional) {
+  const r = await fetch(path, { headers: { Authorization: 'Bearer ' + token } })
+  if (r.status === 401) throw new Error('That token was not accepted.')
+  if (r.status === 403) throw new Error('That token is valid but lacks the viewer role.')
+  // A control plane that predates an endpoint answers 404. Optional reads say so
+  // on the page instead of sending the reader back to the token gate.
+  if (r.status === 404 && optional) return null
+  if (!r.ok) throw new Error('The API returned ' + r.status + '.')
+  return r.json()
+}
+
+/** The first and last bucket that actually hold traffic. */
+function extent(cells) {
+  if (!cells.length) return null
+  let lo = Infinity, hi = -Infinity
+  for (const c of cells) { lo = Math.min(lo, c.t); hi = Math.max(hi, c.t) }
+  return { lo, hi }
+}
+
+/** route -> t -> Map(served -> answered), from a by=model,served_model series. */
+function byRoute(cells) {
+  const routes = new Map()
+  for (const c of cells) {
+    if (!c.answered) continue
+    const [route, served] = c.key
+    if (!routes.has(route)) routes.set(route, new Map())
+    const buckets = routes.get(route)
+    if (!buckets.has(c.t)) buckets.set(c.t, new Map())
+    const m = buckets.get(c.t)
+    m.set(served, (m.get(served) || 0) + c.answered)
+  }
+  return routes
+}
+
+/** The served model that answered most in a bucket; ties go to the name that sorts first. */
+function dominant(served) {
+  let best, bestN = -1
+  for (const [s, n] of served) {
+    if (n > bestN || (n === bestN && String(s) < String(best))) { best = s; bestN = n }
+  }
+  return best
+}
+
+/**
+ * Where the served model changed under a route: the first bucket whose dominant
+ * served model differs from the previous bucket that had traffic. A bucket that
+ * held more than one is flagged, because the change happened inside it.
+ */
+function changePoints(cells) {
+  const out = []
+  for (const [route, buckets] of byRoute(cells)) {
+    let prev
+    for (const t of [...buckets.keys()].sort((a, b) => a - b)) {
+      const served = buckets.get(t)
+      const now = dominant(served)
+      if (prev !== undefined && now !== prev) {
+        out.push({ t, route, from: prev, to: now, within: served.size > 1 })
+      }
+      prev = now
+    }
+  }
+  return out.sort((a, b) => a.t - b.t)
+}
+
+/**
+ * Simulated only when the dev traffic script recorded that it caused this exact
+ * change: same route, same model it switched to, within two buckets. Anything
+ * else is observed. The label never creates a change; the counts do.
+ */
+function sourceOf(change, annotations, bucket) {
+  const hit = (annotations || []).some((a) =>
+    a.kind === 'simulated_served_model_change' && a.route_model === change.route &&
+    a.served_model === change.to && Math.abs(a.at - change.t) <= 2 * bucket)
+  return hit ? 'simulated' : 'observed'
+}
+
+/** Each policy version's first bucket, from a by=policy_version,served_model series. */
+function firstSeen(cells) {
+  const first = new Map()
+  for (const c of cells) {
+    const v = c.key[0]
+    if (v == null || !c.count) continue
+    if (!first.has(v) || c.t < first.get(v)) first.set(v, c.t)
+  }
+  return [...first.entries()].sort((a, b) => a[1] - b[1])
+}
+
+const PALETTE = ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)', 'var(--s5)']
+function colours(...series) {
+  const order = []
+  for (const cells of series) for (const c of [...cells].sort((a, b) => a.t - b.t)) {
+    const s = c.key[1]
+    if (s !== NOT_STATED && !order.includes(s)) order.push(s)
+  }
+  return new Map(order.map((s, i) => [s, PALETTE[i % PALETTE.length]]))
+}
+const paint = (el, served, colour) => {
+  if (served === NOT_STATED) el.classList.add('hollow')
+  else el.style.background = colour.get(served)
+}
+const when = (t, span) => new Date(t * 1000).toLocaleString([], span > 86400
+  ? { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }
+  : { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+const servedName = (s) => s === NOT_STATED ? 'not stated' : s
+
+function renderGate(message) {
+  const app = document.getElementById('app')
+  app.innerHTML = ''
+  app.append($(`<h1>Did the model change under you?</h1>`))
+  app.append($(`<p class="sub">Which model providers said served each route, read live from this
+    control plane. It needs a token with the viewer role or better.</p>`))
+  const gate = $(`<form class="gate">
+    <label for="tok">API token</label>
+    <input id="tok" type="password" autocomplete="off" spellcheck="false" placeholder="a token with the viewer role or better">
+    <p>The same token the <a href="/dashboard">savings dashboard</a> takes, held in this tab only,
+       in <code>sessionStorage</code>, and sent only to this origin.</p>
+    ${message ? `<p class="err">${esc(message)}</p>` : ''}
+    <p><button class="primary" type="submit">Show me</button></p>
+  </form>`)
+  gate.addEventListener('submit', (e) => {
+    e.preventDefault()
+    token = gate.querySelector('#tok').value.trim()
+    sessionStorage.setItem('switchboard.token', token)
+    load()
+  })
+  app.append(gate)
+}
+
+async function load() {
+  const app = document.getElementById('app')
+  app.innerHTML = '<p class="empty">Reading…</p>'
+  let served, mix, notes
+  try {
+    ;[served, mix, notes] = await Promise.all([
+      api(`/v1/series?hours=${hours}&by=model,served_model&measures=answered`, true),
+      api(`/v1/series?hours=${hours}&by=policy_version,served_model&measures=answered,failed_over,skipped`, true),
+      api(`/v1/annotations?hours=${hours}`, true),
+    ])
+  } catch (e) {
+    renderGate(e.message)
+    return
+  }
+
+  app.innerHTML = ''
+  app.append($(`<h1>Did the model change under you?</h1>`))
+  app.append($(`<p class="sub">A provider can answer a request for one model with another: an alias
+    moved to a new snapshot, a fallback it chose. Every figure here is the model the provider
+    said served the request, read from this control plane's telemetry. <a href="/dashboard">Where the
+    tokens went</a> is the other view.</p>`))
+
+  const controls = $(`<div class="controls"></div>`)
+  const win = $(`<label>Window<select>${[1, 6, 24, 24 * 7, 24 * 30]
+    .map((h) => `<option value="${h}"${h === hours ? ' selected' : ''}>${h <= 24 ? h + (h === 1 ? ' hour' : ' hours') : h / 24 + ' days'}</option>`).join('')}</select></label>`)
+  win.querySelector('select').addEventListener('change', (e) => { hours = +e.target.value; load() })
+  controls.append(win)
+  app.append(controls)
+
+  if (!served || !mix) {
+    app.append($(`<p class="note"><strong>This control plane has no <code>/v1/series</code>.</strong>
+      It predates the served-model view; upgrade it and this page fills in.</p>`))
+    return
+  }
+
+  const bucket = served.bucket_seconds
+  const span = extent([...served.cells, ...mix.cells])
+  const colour = colours(served.cells, mix.cells)
+  const annotations = notes ? notes.simulated : []
+  if (!span) {
+    app.append($(`<p class="empty">No answered requests in the last ${served.window_hours} hours.</p>`))
+    return
+  }
+  const lo = span.lo, hi = span.hi + bucket
+  const x = (t) => ((t - lo) / (hi - lo)) * 100
+  const w = (100 * bucket) / (hi - lo)
+  const axis = () => $(`<div class="axis"><span>${when(lo, hi - lo)}</span><span>${when(hi, hi - lo)}</span></div>`)
+
+  // Panel A.
+  app.append($(`<h2>Did the served model change under a fixed route?</h2>`))
+  const a = $(`<div class="panel"></div>`)
+  const routes = [...byRoute(served.cells).entries()].sort((p, q) =>
+    sum(q[1]) - sum(p[1]))
+  function sum(buckets) { let n = 0; for (const m of buckets.values()) for (const v of m.values()) n += v; return n }
+  for (const [route, buckets] of routes) {
+    const row = $(`<div class="route"><span class="name" title="${esc(route)}">${esc(route)}</span><div class="strip"></div></div>`)
+    const strip = row.querySelector('.strip')
+    for (const [t, m] of buckets) {
+      const total = [...m.values()].reduce((p, q) => p + q, 0)
+      const seg = $(`<div class="seg" title="${esc(when(t, hi - lo))}: ${[...m].map(([s, n]) => esc(servedName(s)) + ' ×' + n).join(', ')}"></div>`)
+      Object.assign(seg.style, { left: x(t) + '%', width: w + '%' })
+      for (const [s, n] of [...m].sort((p, q) => q[1] - p[1])) {
+        const part = $(`<i></i>`)
+        part.style.flex = String(n / total)
+        paint(part, s, colour)
+        seg.append(part)
+      }
+      strip.append(seg)
+    }
+    a.append(row)
+  }
+  a.append(axis())
+  app.append(a)
+
+  const changes = changePoints(served.cells)
+  if (!changes.length) {
+    app.append($(`<p class="note"><strong>No route changed served model in this window.</strong></p>`))
+  } else {
+    const versionsAt = (t) => [...new Set(mix.cells.filter((c) => c.t === t && c.count).map((c) => c.key[0]))]
+    app.append($(`<div class="wide"><table>
+      <thead><tr><th>When</th><th>Route</th><th>Served</th><th>Policy</th><th>Source</th></tr></thead>
+      <tbody>${changes.map((c) => {
+        const src = sourceOf(c, annotations, bucket)
+        const before = versionsAt(c.t - bucket).join(', '), after = versionsAt(c.t).join(', ')
+        return `<tr>
+          <td>${esc(when(c.t, hi - lo))}${c.within ? '<br><span class="note">within this bucket</span>' : ''}</td>
+          <td><code>${esc(c.route)}</code></td>
+          <td><code>${esc(servedName(c.from))}</code> → <code>${esc(servedName(c.to))}</code></td>
+          <td>${after && before === after ? 'v' + esc(after) + ', unchanged' : esc(after ? 'v' + after : '—')}</td>
+          <td><span class="chip ${src}">${src === 'simulated' ? 'simulated — injected by the mock provider' : 'observed'}</span></td>
+        </tr>`
+      }).join('')}</tbody></table></div>`))
+  }
+
+  // Panel B.
+  app.append($(`<h2>Answers by served model, per policy version</h2>`))
+  const b = $(`<div class="panel"></div>`)
+  const plot = $(`<div class="mix"></div>`)
+  const health = $(`<div class="health" title="failed over (upper) and skipped a route (lower), share of requests"></div>`)
+  const perT = new Map()
+  for (const c of mix.cells) {
+    if (!perT.has(c.t)) perT.set(c.t, { answered: 0, count: 0, failed: 0, skipped: 0, served: new Map() })
+    const agg = perT.get(c.t)
+    agg.answered += c.answered; agg.count += c.count; agg.failed += c.failed_over; agg.skipped += c.skipped
+    if (c.answered) agg.served.set(c.key[1], (agg.served.get(c.key[1]) || 0) + c.answered)
+  }
+  for (const [t, agg] of perT) {
+    if (agg.answered) {
+      const col = $(`<div class="col" title="${esc(when(t, hi - lo))}: ${[...agg.served].map(([s, n]) => esc(servedName(s)) + ' ×' + n).join(', ')}"></div>`)
+      Object.assign(col.style, { left: x(t) + '%', width: w + '%' })
+      for (const [s, n] of [...agg.served].sort((p, q) => String(p[0]).localeCompare(String(q[0])))) {
+        const part = $(`<i></i>`)
+        part.style.height = (100 * n / agg.answered) + '%'
+        paint(part, s, colour)
+        col.append(part)
+      }
+      plot.append(col)
+    }
+    if (agg.count) {
+      for (const [share, top, tone] of [[agg.failed / agg.count, 0, 'var(--warn)'], [agg.skipped / agg.count, 5, 'var(--faint)']]) {
+        if (!share) continue
+        const bar = $(`<i></i>`)
+        Object.assign(bar.style, { left: x(t) + '%', width: w + '%', top: top + 'px', height: '5px', opacity: String(Math.max(.25, share)), background: tone })
+        health.append(bar)
+      }
+    }
+  }
+  // A version is drawn where it first appears in telemetry, not when it was
+  // published: gateways poll for policy, so the two differ by up to a poll.
+  const published = new Map((notes?.policies || []).map((p) => [String(p.version), p.published_at]))
+  for (const [v, t] of firstSeen(mix.cells)) {
+    const rule = $(`<div class="rule" title="${published.has(v) ? 'published ' + esc(when(published.get(v), hi - lo)) : ''}"><span>v${esc(v)}</span></div>`)
+    rule.style.left = x(t) + '%'
+    plot.append(rule)
+  }
+  for (const n of annotations) {
+    if (n.at < lo || n.at > hi) continue
+    const mark = $(`<div class="sim" title="simulated: the mock provider now answers ${esc(n.route_model)} as ${esc(n.served_model)}"></div>`)
+    mark.style.left = x(n.at) + '%'
+    plot.append(mark)
+  }
+  b.append(plot, health, axis())
+
+  const seen = [...colour.keys()]
+  const hasNull = [...served.cells, ...mix.cells].some((c) => c.key[1] === NOT_STATED && c.answered)
+  b.append($(`<div class="legend">${seen.map((s) => `<span><i class="swatch" style="background:${colour.get(s)}"></i><code>${esc(s)}</code></span>`).join('')}
+    ${hasNull ? '<span><i class="swatch hollow"></i>the provider did not say</span>' : ''}
+    <span><span class="chip">simulated</span> dashed line: a change the dev traffic script injected</span></div>`))
+  app.append(b)
+
+  app.append($(`<p class="note"><strong>Simulated is a label, not a cause.</strong> A change is marked
+    simulated only when the dev traffic script recorded that it made the mock provider answer as
+    that model; the counts either side of it are telemetry, and every other change is observed.
+    A hollow box is a provider that named no model, which Bedrock never does — it is not filled in
+    with the model that was sent.</p>`))
+  const cut = [served, mix].some((s) => s.truncated)
+  app.append($(`<p class="note">Window: last ${served.window_hours} hours, in ${bucket}-second buckets of
+    when each request started.${cut ? ' <strong>Capped at ' + fmt(served.cell_limit) + ' cells, so this is part of the window.</strong>' : ''}
+    ${notes ? '' : ' This control plane has no <code>/v1/annotations</code>, so nothing can be labelled simulated.'}</p>`))
+}
+
+token ? load() : renderGate()
+</script>

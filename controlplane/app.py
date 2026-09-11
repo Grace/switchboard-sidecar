@@ -712,6 +712,14 @@ def create_app(pool=None, seed=None, key_id=None):
         # file off local disk on a route nobody polls.
         return HTMLResponse((pathlib.Path(__file__).parent / "dashboard.html").read_text())
 
+    @app.get("/dashboard/drift", response_class=HTMLResponse)
+    def dashboard_drift():
+        """Served-model drift and the model mix over time, beside the savings dashboard.
+
+        A page of its own rather than panels in dashboard.html, so the two views
+        can change independently. Served the same way, for the same reasons."""
+        return HTMLResponse((pathlib.Path(__file__).parent / "drift.html").read_text())
+
     @app.post("/v1/health")
     def health_sync(body: HealthSync, s=Depends(session, scope="function")):
         """Exchange circuit state with the rest of this tenant's fleet.

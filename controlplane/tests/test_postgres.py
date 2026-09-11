@@ -590,3 +590,17 @@ def test_simulated_annotations_are_dev_only_audited_and_tenant_scoped(setup, mon
 
     other = client.get("/v1/annotations?hours=1", headers=auth(tokens, tenant="tenant-b", role="viewer")).json()
     assert all(a["served_model"] != body["served_model"] for a in other["simulated"]), other
+
+
+def test_the_drift_page_is_a_shell_served_from_this_origin(setup):
+    """Like /dashboard: no data and no credential in the document, so no token to fetch it.
+
+    Everything it shows comes from authenticated reads it makes afterwards, which
+    is also why it can be served without one."""
+    client, _, _ = setup
+    r = client.get("/dashboard/drift")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("text/html"), r.headers
+    assert "/v1/series" in r.text and "/v1/annotations" in r.text
+    # No third-party origin: the page authenticates with a bearer token.
+    assert "https://" not in r.text and "http://" not in r.text
