@@ -56,6 +56,11 @@ type Metrics struct {
 	// means pay the provider, a refusal means fix a credential or a model name --
 	// and apart from Errors because the caller was served.
 	RefusedFailover atomic.Int64
+	// FleetHints is how many providers the rest of this tenant's fleet is
+	// currently reporting as unhealthy. A gauge rather than a counter: it is a
+	// current view, and a number that stays above zero for a long time is the
+	// interesting case.
+	FleetHints atomic.Int64
 	// RateLimitRetry counts requests that waited out a stated Retry-After on the
 	// same provider rather than failing over. Each one traded latency for price
 	// and spent an attempt doing it, so read it beside requests_total: a large
@@ -350,6 +355,7 @@ func (m *Metrics) series() []series {
 		{"refused_failover_total", "counter", &m.RefusedFailover},
 		{"prompt_cache_marked_total", "counter", &m.PromptCacheMarked},
 		{"rate_limit_retry_total", "counter", &m.RateLimitRetry},
+		{"fleet_unhealthy_providers", "gauge", &m.FleetHints},
 		{"provider_probe_failed_total", "counter", &m.ProviderProbeFailed},
 		{"budget_skip_total", "counter", &m.BudgetSkip},
 		{"temperature_dropped_total", "counter", &m.TemperatureDropped},

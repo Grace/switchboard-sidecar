@@ -185,6 +185,19 @@ type Server struct {
 	// prefixes decides when a system prompt is worth a provider cache write.
 	// nil unless prompt_caching is configured, and worthCaching tolerates nil.
 	prefixes *prefixCache
+	// fleet is what the rest of this tenant's gateways have reported. nil unless
+	// fleet_health is configured, and every method tolerates nil.
+	fleet *fleetHealth
+	// instanceID is random per process and never persisted. It exists only so
+	// the control plane can count how many distinct gateways agree about a
+	// provider before the fleet acts on it.
+	instanceID string
+	// reported is what this process currently believes is wrong, drained by each
+	// sync. Separate from the circuits themselves because a circuit records
+	// local health and this records what is worth telling anyone else -- which
+	// is a much smaller set, see shareable().
+	reportMu sync.Mutex
+	reported map[string]fault
 	// temps remembers which models refused a temperature, so the 400 is paid
 	// once per model rather than on every request. See temperature.go.
 	temps *temperatureTable
@@ -216,7 +229,7 @@ type Server struct {
 }
 
 func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
-	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}, budgets: newBudgetTable(), temps: newTemperatureTable(), prefixes: promptCacheFor(c)}
+	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}, budgets: newBudgetTable(), temps: newTemperatureTable(), prefixes: promptCacheFor(c), fleet: fleetFor(c), instanceID: randomID(8), reported: map[string]fault{}}
 }
 
 // ready reports whether this gateway can serve a request. It deliberately does
@@ -230,6 +243,32 @@ func (s *Server) ready() bool { return s.notReady() == "" }
 // empty-bodied 503, which is the least useful thing a first run can produce: a
 // wrong trust key, an unregistered control token, a tenant with no published
 // policy and a policy that quietly expired were indistinguishable.
+// share records a fault worth telling the fleet about. Called where the local
+// circuit is already being updated, so the two cannot disagree about what
+// happened -- only about who needs to know.
+func (s *Server) share(provider string, f fault) {
+	if s.fleet == nil || !shareable(f) {
+		return
+	}
+	s.reportMu.Lock()
+	s.reported[provider] = f
+	s.reportMu.Unlock()
+}
+
+// drainReports takes what this process has seen since the last sync. Drained
+// rather than read, because a fault that has stopped recurring should stop being
+// reported: the next sync carries only what the interval actually produced.
+func (s *Server) drainReports() map[string]fault {
+	if s.fleet == nil {
+		return nil
+	}
+	s.reportMu.Lock()
+	defer s.reportMu.Unlock()
+	out := s.reported
+	s.reported = map[string]fault{}
+	return out
+}
+
 func (s *Server) notReady() string {
 	if s.Draining.Load() {
 		return "draining"
@@ -582,11 +621,17 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		eligible++
-		if s.budgets.skip(route.Provider, route.Model, c.MaxTokens) {
+		// Two independent reasons to pass a route over, folded into one map so
+		// the rule below counts them together. They must be: each is safe alone
+		// and the pair can still cover everything.
+		if s.budgets.skip(route.Provider, route.Model, c.MaxTokens) || s.fleet.unhealthy(route.Provider) {
 			skip[i] = true
 		}
 	}
 	if len(skip) == eligible {
+		// Refusing to try is worse than trying and failing over, and a fleet
+		// report that emptied the policy would be an outage this gateway caused
+		// itself while the providers were reachable.
 		skip = map[int]bool{}
 	}
 
@@ -723,6 +768,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			event.Fault = f.String()
 			switch f {
 			case faultAccount:
+				s.share(route.Provider, faultAccount)
 				// This account cannot serve at all. The provider is healthy, so
 				// this is a cooldown rather than a health failure, but a long
 				// one: it will not clear in the breaker's 15 seconds, and the
@@ -782,6 +828,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				continue
 			case faultDegraded:
 				// Provider degraded. This is what the breaker is for.
+				s.share(route.Provider, faultDegraded)
 				s.circuits[route.Provider].result(true)
 				if wait > 0 {
 					s.circuits[route.Provider].cooldown(wait)
@@ -1185,6 +1232,11 @@ func (s *Server) Sync(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		s.syncOnce(ctx)
+		// On the same ticker, deliberately after the policy fetch and
+		// deliberately not part of it. GET /v1/policy serves a signed document
+		// this gateway will verify and act on; nothing about advisory health
+		// state should be able to fail, delay or confuse that path.
+		s.fleetSyncOnce(ctx)
 		select {
 		case <-ctx.Done():
 			return

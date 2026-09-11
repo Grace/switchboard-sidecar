@@ -81,6 +81,30 @@ class Event(Strict):
     # when both halves can be released together.
     ext: dict[str, Any] = Field(default_factory=dict)
 
+class HealthReport(Strict):
+    """One gateway's current statement about one provider.
+
+    Only the two fault classes that can be true for someone else. A refused
+    fault is one deployment's wrong key and a terminal fault is one caller's bad
+    request; neither says anything about the provider, and the Literal here is
+    what stops either being reported at all.
+    """
+    provider: Literal["openai", "anthropic", "gemini", "bedrock"]
+    fault: Literal["account", "degraded"]
+    # How long the reporter thinks its own cooldown lasts. Bounded on read, so a
+    # buggy or hostile gateway cannot park a provider indefinitely.
+    ttl_seconds: int = Field(ge=1, le=300)
+
+
+class HealthSync(Strict):
+    # Random per process, not persisted. It exists only to count distinct
+    # agreeing instances inside one window.
+    instance_id: str = Field(pattern=r"^[0-9a-f]{16}$")
+    # Empty is the normal case: a healthy gateway still polls, because polling
+    # is how it hears about everyone else.
+    reports: list[HealthReport] = Field(default_factory=list, max_length=8)
+
+
 class EventBatch(Strict):
     # Bounded in the model rather than checked by hand: an unbounded array is a
     # denial-of-service vector against a route that inserts every element, and a
@@ -263,6 +287,63 @@ def create_app(pool=None, seed=None, key_id=None):
     # predates batching keeps working and a gateway that postdates an old control
     # plane falls back to it on 404. Either component can be deployed first, which
     # is what makes this safe to ship independently.
+    @app.post("/v1/health")
+    def health_sync(body: HealthSync, s=Depends(session, scope="function")):
+        """Exchange circuit state with the rest of this tenant's fleet.
+
+        Deliberately not part of GET /v1/policy. That path is the trust anchor:
+        it serves a signed document a gateway will verify and act on, and
+        nothing about advisory health state should be able to fail, slow or
+        confuse it. Same ticker, separate endpoint.
+
+        The response is advisory in the strict sense -- a gateway that never
+        calls this, or calls it and gets an error, behaves exactly as it did
+        before this endpoint existed. That property is the reason the feature is
+        safe to ship, so it is worth not trading away later for a faster
+        propagation story.
+        """
+        db, p = s
+        require(p, "agent")
+
+        for r in body.reports:
+            # One row per instance per provider, overwritten each poll. A report
+            # is a current statement, not an event: keeping the history would be
+            # a retention problem in exchange for nothing.
+            db.execute(
+                """INSERT INTO provider_health(tenant_id,instance_id,provider,fault,reported_at,expires_at)
+                   VALUES(%s,%s,%s,%s,now(),now() + make_interval(secs => %s))
+                   ON CONFLICT (tenant_id,instance_id,provider)
+                   DO UPDATE SET fault=EXCLUDED.fault, reported_at=now(), expires_at=EXCLUDED.expires_at""",
+                (p["tenant_id"], body.instance_id, r.provider, r.fault, r.ttl_seconds))
+
+        # Swept on read rather than on a schedule. The table is small, the read
+        # already touches the tenant's rows, and a sweep nobody runs is how the
+        # idempotency store ended up holding a week of entries under a one-day
+        # TTL.
+        db.execute("DELETE FROM provider_health WHERE expires_at <= now()")
+
+        db.execute(
+            """SELECT provider, fault, count(DISTINCT instance_id) AS instances,
+                      max(expires_at) AS until
+                 FROM provider_health
+                WHERE expires_at > now()
+                GROUP BY provider, fault""")
+        unhealthy = []
+        for row in db.fetchall():
+            # An account fault is unambiguous: the provider said this tenant
+            # cannot pay, and one instance hearing it is enough. A degraded
+            # fault is a 5xx, which might be one host's network, so it needs a
+            # second instance to agree before the fleet acts on it.
+            if row["fault"] == "degraded" and row["instances"] < 2:
+                continue
+            unhealthy.append({
+                "provider": row["provider"],
+                "fault": row["fault"],
+                "instances": row["instances"],
+                "seconds": max(1, int((row["until"] - datetime.now(timezone.utc)).total_seconds())),
+            })
+        return {"unhealthy": unhealthy}
+
     @app.post("/v1/telemetry/batch")
     def telemetry_batch(body: EventBatch, s=Depends(session, scope="function")):
         db, p = s

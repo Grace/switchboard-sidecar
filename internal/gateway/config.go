@@ -106,6 +106,14 @@ type Config struct {
 	// is the operator saying how long their callers will wait to stay on the
 	// cheaper route.
 	RateLimitRetryMaxMs int `json:"rate_limit_retry_max_ms"`
+	// FleetHealth shares circuit state with the other gateways on this tenant,
+	// through the control plane, on the policy sync ticker.
+	//
+	// Off by default. It is advisory in the strict sense -- with it off, or with
+	// the control plane unreachable, routing behaves exactly as it did before
+	// this existed -- but it is still one process acting on another's evidence,
+	// and that is an operator's decision to make rather than a default.
+	FleetHealth bool `json:"fleet_health"`
 	// CaptureTTLSeconds enables replay capture and sets how long a record lives.
 	// Zero disables it, and zero is the default, for the same reason the
 	// idempotency store defaults off and more so: a record holds the prompt as

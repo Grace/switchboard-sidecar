@@ -434,6 +434,51 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     across a fleet would give every gateway what one of them learned, with no new
     dependency.
 
+25. **Circuit state, shared across a fleet, without becoming a dependency.**
+    A gateway learns a provider is unhealthy by paying for it -- three failures
+    before the breaker opens, per process. Four gateways pay the same three
+    failures for the same outage, and an autoscaled fleet pays again on every
+    new instance for as long as it lasts. The knowledge existed and did not
+    travel.
+
+    **What is shared is the design.** The fault classes do not mean the same
+    thing to someone else. `account` is true for every gateway holding that
+    tenant's key and is exactly what an external status page cannot see.
+    `degraded` is plausibly the provider but might be one host's network, so the
+    control plane makes it wait for a second instance to agree. `refused` and
+    `terminal` are never shared: a 401 is one deployment's wrong key and a 400
+    is one caller's bad request, and broadcasting either would take a provider
+    away from a fleet it is serving perfectly well. `shareable()` is a named
+    function rather than a condition inline, because it is the whole safety
+    argument.
+
+    **Three properties keep it advisory, and all three are easy to lose.**
+    Hints are checked beside the local circuit and never folded into it, so a
+    wrong hint costs a skipped route and never corrupts locally learned state.
+    Hints expire in less than the poll that refreshes them, so a control plane
+    that stops answering means hints lapse and the gateway decides alone --
+    which is what it did before this existed, and is the reason this is not a
+    new dependency. And **the fleet can never empty a policy**: when every
+    eligible route is hinted against, none is. Removing that last rule turns a
+    full fleet report into a 503 the gateway caused itself while the providers
+    were reachable, which the tests assert directly.
+
+    Carried on the policy ticker but deliberately not on `GET /v1/policy`. That
+    path serves a signed document the gateway verifies and acts on, and nothing
+    about advisory health state should be able to fail, delay or confuse it.
+    `POST /v1/health` is its own endpoint on the same 15 seconds.
+
+    Reports drain rather than accumulate, so a fault that stops recurring stops
+    being reported. Durations are bounded by the reader as well as the writer,
+    because the writer is another gateway. Instance ids are random per process
+    and never persisted; they exist only to count how many distinct gateways
+    agree.
+
+    **The honest bound:** propagation is one poll interval and the local open
+    window is the same 15 seconds, so this pays off on sustained outages rather
+    than on blips. That is worth stating, because it is the reason not to spend
+    anything chasing faster propagation.
+
 ## Still open
 
 1. **Deployment is proven for the quickstart only.** `quickstart.yaml` has been
@@ -798,8 +843,8 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    external authorization, hardware-backed signing and automated key renewal do
    not. Row level security defends against query mistakes, not against a
    compromised shared database session.
-13. **Scale and operations.** Rate limits and circuit state are per process, not
-   fleet-wide. There is no retention policy, partitioning, dashboard, SLO, audit
+13. **Scale and operations.** Rate limits are per process. **Circuit state no
+   longer is**, when `fleet_health` is on: item 25 records how. There is no retention policy, partitioning, dashboard, SLO, audit
    export or restore drill.
 14. **The release pipeline works, and the first OIDC run failed for a reason
     worth writing down.** `v0.4.0` published both images to ECR with cosign
