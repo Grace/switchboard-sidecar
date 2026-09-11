@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -269,5 +270,160 @@ func TestTheRouteHeaderOnAnOrdinaryRequest(t *testing.T) {
 	}
 	if !strings.Contains(got, ":200") {
 		t.Errorf("route = %q; want the upstream status", got)
+	}
+}
+
+// TestABreakerSkipIsRecordedAndIsNotAnAttempt covers the behaviour that was
+// entirely invisible.
+//
+// Driving requests at a policy whose first route is failing, the breaker opens
+// after three consecutive failures and every later request goes straight past
+// that provider. Those are provider calls not made and not billed -- the most
+// valuable thing the breaker does -- and the code recorded nothing at all, so a
+// dashboard could report four failovers out of twenty-five and had no way to say
+// where the other twenty-one went.
+//
+// The second assertion matters as much as the first. A skip must not increment
+// Attempts: nothing was sent and nothing was billed, and counting it would
+// overstate what the request cost on the one number /v1/savings is for.
+func TestABreakerSkipIsRecordedAndIsNotAnAttempt(t *testing.T) {
+	var firstCalls atomic.Int64
+	down := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstCalls.Add(1)
+		w.WriteHeader(503)
+	}))
+	defer down.Close()
+	up := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`)
+	}))
+	defer up.Close()
+
+	s := testServer(t, map[string]ProviderConfig{
+		"openai":    {URL: down.URL, KeyEnv: "PROVIDER_KEY"},
+		"anthropic": {URL: up.URL, KeyEnv: "PROVIDER_KEY"},
+	})
+
+	// Enough to trip the consecutive-failure rule with room to spare.
+	var skipped Event
+	tel, err := NewTelemetry(Config{DataDir: t.TempDir(), ControlURL: "http://127.0.0.1:1", QueueSize: 64}, s.Metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	useTestTransport(tel.http)
+	s.Telemetry = tel
+
+	for i := 0; i < 8; i++ {
+		if w := call(s, chat); w.Code != 200 {
+			t.Fatalf("request %d: %d %s", i, w.Code, w.Body)
+		}
+	}
+
+	events := make([]Event, 0, 8)
+	for {
+		select {
+		case e := <-tel.queue:
+			events = append(events, e)
+			continue
+		default:
+		}
+		break
+	}
+	if len(events) == 0 {
+		t.Fatal("no events emitted")
+	}
+
+	for _, e := range events {
+		for _, sk := range e.Skipped {
+			if sk.Reason == "circuit_open" {
+				skipped = e
+			}
+		}
+	}
+	if len(skipped.Skipped) == 0 {
+		t.Fatalf("the breaker never skipped a route across %d requests; "+
+			"the first provider was called %d times, so either it did not open "+
+			"or the skip is still unrecorded", len(events), firstCalls.Load())
+	}
+
+	// A skip is not an attempt.
+	if skipped.Attempts != len(skipped.Tries) {
+		t.Errorf("Attempts = %d but %d attempts recorded", skipped.Attempts, len(skipped.Tries))
+	}
+	for _, sk := range skipped.Skipped {
+		for _, tr := range skipped.Tries {
+			if tr.Order == sk.Order {
+				t.Errorf("a skip and an attempt share order %d; the route listing "+
+					"cannot interleave them", sk.Order)
+			}
+		}
+	}
+
+	// And it reaches the caller, which is the whole point.
+	got := skipped.routeHeader()
+	if !strings.Contains(got, "skipped circuit_open") {
+		t.Errorf("route header %q does not name the skip", got)
+	}
+	if !strings.Contains(got, "anthropic/") {
+		t.Errorf("route header %q does not name the provider that answered", got)
+	}
+	if i, j := strings.Index(got, "skipped"), strings.Index(got, "anthropic/"); i > j {
+		t.Errorf("route header %q puts the skip after the answer; order is the information", got)
+	}
+	if got2 := skipped.wire().Ext["skipped"]; got2 == nil {
+		t.Error("ext.skipped is absent, so the control plane cannot count it")
+	}
+}
+
+// TestTheAttemptRecordReachesTheControlPlane closes a gap that made the
+// per-attempt work useless outside this process.
+//
+// Event.Tries drove the route header and the usage total, and wire() never
+// serialised it. So the control plane could see that a request made two
+// attempts and could not see what either of them cost -- which is the whole
+// point of recording them separately. A savings view could report a failover
+// happened and not what the failover was billed.
+func TestTheAttemptRecordReachesTheControlPlane(t *testing.T) {
+	first := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, emptyByBudget) // 200, billed 9 in and 1024 out, no text
+	}))
+	defer first.Close()
+	second := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"content":[{"type":"text","text":"rescued"}],"stop_reason":"end_turn",`+
+			`"usage":{"input_tokens":41,"output_tokens":12}}`)
+	}))
+	defer second.Close()
+
+	s := testServer(t, map[string]ProviderConfig{
+		"openai":    {URL: first.URL, KeyEnv: "PROVIDER_KEY"},
+		"anthropic": {URL: second.URL, KeyEnv: "PROVIDER_KEY"},
+	})
+	e := emitted(t, s, chat)
+
+	raw, ok := e.wire().Ext["tries"].([]any)
+	if !ok || len(raw) != 2 {
+		t.Fatalf("ext.tries = %#v, want two attempts; without it the control plane "+
+			"sees that a failover happened and not what it cost", e.wire().Ext["tries"])
+	}
+
+	one, _ := raw[0].(map[string]any)
+	two, _ := raw[1].(map[string]any)
+	if one["provider"] != "openai" || two["provider"] != "anthropic" {
+		t.Errorf("attempts out of order: %v then %v", one["provider"], two["provider"])
+	}
+	// The number this exists for: the attempt that produced nothing was still
+	// billed, and its cost has to be attributable to it rather than folded into
+	// a total that names the provider which answered.
+	if one["gen_ai.usage.input_tokens"] != 9 {
+		t.Errorf("attempt 1 input tokens = %v, want 9", one["gen_ai.usage.input_tokens"])
+	}
+	if one["gen_ai.usage.output_tokens"] != 1024 {
+		t.Errorf("attempt 1 output tokens = %v, want 1024 -- the tokens burnt "+
+			"producing no text", one["gen_ai.usage.output_tokens"])
+	}
+	if two["gen_ai.usage.input_tokens"] != 41 {
+		t.Errorf("attempt 2 input tokens = %v, want 41", two["gen_ai.usage.input_tokens"])
+	}
+	if one["fault"] != "empty_completion" {
+		t.Errorf("attempt 1 fault = %v, want empty_completion", one["fault"])
 	}
 }

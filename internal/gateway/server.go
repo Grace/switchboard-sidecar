@@ -728,6 +728,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		route := p.Routes[i]
 		pc, ok := s.C.Providers[route.Provider]
 		if !ok {
+			// In the signed policy, absent from this gateway's config. A
+			// deployment mismatch rather than a provider problem, and silently
+			// stepping over it is how that goes unnoticed for a week.
+			event.skip(route.Provider, route.Model, "not_configured")
 			continue
 		}
 		if skip[i] {
@@ -736,15 +740,22 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// to learn what is already known.
 			s.Metrics.BudgetSkip.Add(1)
 			event.BudgetSkipped = append(event.BudgetSkipped, route.Provider+":"+route.Model)
+			event.skip(route.Provider, route.Model, "budget")
 			continue
 		}
 		if event.Attempts >= s.C.MaxAttempts {
 			break
 		}
 		if c.Stream && !streams(route.Provider) {
+			event.skip(route.Provider, route.Model, "stream_unsupported")
 			continue
 		}
 		if !s.circuits[route.Provider].allow() {
+			// The breaker's most valuable work, and until now a bare continue
+			// that recorded nothing. This is a provider call not made and not
+			// billed, and it is why a run of failures produces far fewer
+			// failovers than requests.
+			event.skip(route.Provider, route.Model, "circuit_open")
 			continue
 		}
 		if event.Attempts > 0 {

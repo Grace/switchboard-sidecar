@@ -599,6 +599,22 @@ type Event struct {
 	// legitimately in normal operation, because the caller names a policy alias
 	// and the policy resolves it to a provider's own model name.
 	Requested string `json:"-"`
+	// Skipped is every route the loop passed over without calling it.
+	//
+	// The circuit breaker's most valuable work is invisible without this.
+	// Driving 25 requests at a policy whose first route was returning 503, only
+	// 4 failed over: the breaker opened after three consecutive failures and the
+	// remaining 21 went straight past that provider. Twenty-one calls not made
+	// and not billed, and nothing anywhere recorded them, so a dashboard could
+	// report "failed over 4" and had no way to say why it was not 25.
+	//
+	// BudgetSkipped below is the same idea for one reason, and predates this. It
+	// stays because it is already on the wire as ext.budget_skipped and the
+	// control plane counts it, and Ext exists precisely so a newer gateway
+	// degrades against an older control plane rather than breaking it. This is
+	// the canonical record and covers the budget case too; the older field is
+	// the budget subset, kept for that ordering.
+	Skipped []skippedRoute `json:"-"`
 	// Tries is the per-attempt detail: one record per upstream call, in the
 	// order they were made.
 	//
@@ -655,6 +671,47 @@ func (e Event) wire() Event {
 	}
 	if len(e.BudgetSkipped) > 0 {
 		ext["budget_skipped"] = e.BudgetSkipped
+	}
+	if len(e.Tries) > 0 {
+		// The per-attempt record, which until now existed only inside this
+		// process: it drove the route header and the usage total and was never
+		// serialised, so the control plane could see that a request made two
+		// attempts and never what either of them cost.
+		//
+		// Usage keys come from tokenUsage.attrs(), the same table the span and
+		// the top-level ext read, so a try, the span and the event cannot
+		// disagree about what a token count is called.
+		//
+		// duration_ms rather than start and end in nanoseconds: absolute timing
+		// belongs on the span, where trace assembly needs it, and everything
+		// reading this aggregates durations. No provider error text, only the
+		// fault class -- the telemetry path carries no provider payloads.
+		out := make([]any, 0, len(e.Tries))
+		for _, t := range e.Tries {
+			m := map[string]any{
+				"order": t.Order, "seq": t.Seq, "span_id": t.SpanID,
+				"provider": t.Provider, "model": t.Model,
+				"status": t.Status, "duration_ms": (t.End - t.Start) / 1e6,
+			}
+			if t.Fault != "" {
+				m["fault"] = t.Fault
+			}
+			for _, a := range t.Usage.attrs() {
+				m[a.key] = a.value
+			}
+			out = append(out, m)
+		}
+		ext["tries"] = out
+	}
+	if len(e.Skipped) > 0 {
+		out := make([]any, 0, len(e.Skipped))
+		for _, sk := range e.Skipped {
+			out = append(out, map[string]any{
+				"order": sk.Order, "provider": sk.Provider,
+				"model": sk.Model, "reason": sk.Reason,
+			})
+		}
+		ext["skipped"] = out
 	}
 	for _, a := range e.Usage.attrs() {
 		ext[a.key] = a.value
@@ -1336,8 +1393,23 @@ func (u tokenUsage) add(o tokenUsage) tokenUsage {
 // Event.Provider, Event.Model and Event.Status describe only the attempt that
 // ended the request. These describe every attempt, including the ones whose
 // tokens were billed and then discarded because the answer was unusable.
+type skippedRoute struct {
+	// Order interleaves this with the attempts. See Event.step.
+	Order    int
+	Provider string
+	Model    string
+	// Reason is why the loop passed over it: circuit_open, budget,
+	// stream_unsupported or not_configured.
+	Reason string
+}
+
 type attemptRecord struct {
-	SpanID   string
+	SpanID string
+	// Order interleaves this with the skips, which is what lets a route listing
+	// show a dead provider being stepped over in the position it was stepped
+	// over in. The loop index cannot do this: the rate-limit path decrements it
+	// to repeat a route, so it is not unique within a request.
+	Order    int
 	Seq      int // 1-based, and equal to Event.Attempts at the time
 	Provider string
 	Model    string
@@ -1348,12 +1420,28 @@ type attemptRecord struct {
 	Usage    tokenUsage
 }
 
+// step is one counter across attempts and skips, so the two can be interleaved
+// in the order they actually happened.
+func (e *Event) step() int {
+	return len(e.Tries) + len(e.Skipped) + 1
+}
+
 // beginTry records that an upstream call is about to be made. The span id is
 // minted here rather than at the end because every exit path from the attempt
 // needs something to refer to, including the ones that never get a status.
 func (e *Event) beginTry(provider, model string, start int64, spanID string) {
 	e.Tries = append(e.Tries, attemptRecord{
-		SpanID: spanID, Seq: len(e.Tries) + 1, Provider: provider, Model: model, Start: start,
+		SpanID: spanID, Order: e.step(), Seq: len(e.Tries) + 1,
+		Provider: provider, Model: model, Start: start,
+	})
+}
+
+// skip records a route the loop passed over. Deliberately not an attempt: it
+// does not increment Attempts, because nothing was sent and nothing was billed,
+// and counting it would overstate what the request cost.
+func (e *Event) skip(provider, model, reason string) {
+	e.Skipped = append(e.Skipped, skippedRoute{
+		Order: e.step(), Provider: provider, Model: model, Reason: reason,
 	})
 }
 
@@ -1595,40 +1683,61 @@ func (t *Telemetry) postSpans(ctx context.Context, spans []any) {
 	}
 }
 
-// routeHeader renders the attempts as one line for X-Switchboard-Route:
+// routeHeader renders the route the request actually took, as one line for
+// X-Switchboard-Route:
 //
-//	openai/gpt-4o-mini:503 rate_limited, anthropic/claude-sonnet-4:200
+//	gemini/gemini-2.0-flash:skipped circuit_open, openai/gpt-4o-mini:200
 //
 // Compact rather than JSON because it is a header, and ordered because the order
 // is the information: the last entry answered, and everything before it is why
 // the request took as long as it did.
 //
+// Skips are included and marked, not omitted. A listing of attempts alone shows
+// the successful half of a routing decision and hides the most valuable half --
+// a provider the breaker had marked down is stepped over, costing nothing, and a
+// reader who cannot see that concludes either that failover is rare or that the
+// count is wrong.
+//
 // A status of 0 means the attempt never got one -- a transport failure or a
 // timeout -- and is rendered as "-" rather than as a number no provider sent.
 func (e Event) routeHeader() string {
-	if len(e.Tries) == 0 {
+	type step struct {
+		order    int
+		provider string
+		model    string
+		outcome  string
+	}
+	steps := make([]step, 0, len(e.Tries)+len(e.Skipped))
+	for _, t := range e.Tries {
+		out := strconv.Itoa(t.Status)
+		if t.Status == 0 {
+			out = "-"
+		}
+		if t.Fault != "" {
+			out += " " + t.Fault
+		}
+		steps = append(steps, step{t.Order, t.Provider, t.Model, out})
+	}
+	for _, sk := range e.Skipped {
+		steps = append(steps, step{sk.Order, sk.Provider, sk.Model, "skipped " + sk.Reason})
+	}
+	if len(steps) == 0 {
 		return ""
 	}
+	sort.Slice(steps, func(i, j int) bool { return steps[i].order < steps[j].order })
+
 	var b strings.Builder
-	for i, t := range e.Tries {
+	for i, st := range steps {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString(t.Provider)
-		if t.Model != "" {
+		b.WriteString(st.provider)
+		if st.model != "" {
 			b.WriteString("/")
-			b.WriteString(t.Model)
+			b.WriteString(st.model)
 		}
 		b.WriteString(":")
-		if t.Status == 0 {
-			b.WriteString("-")
-		} else {
-			b.WriteString(strconv.Itoa(t.Status))
-		}
-		if t.Fault != "" {
-			b.WriteString(" ")
-			b.WriteString(t.Fault)
-		}
+		b.WriteString(st.outcome)
 	}
 	return b.String()
 }
