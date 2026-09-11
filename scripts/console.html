@@ -70,6 +70,9 @@ h2 { font-size: .95rem; margin: 0 0 .2rem; }
 .hop .cost { font-size: .75rem; color: var(--faint); margin-top: .3rem; font-variant-numeric: tabular-nums; }
 .hop.answered { border-left-color: var(--ok); }
 .hop.gaveup { border-left-color: var(--bad); }
+.hop.skipped { border-style: dashed; border-left-style: solid; border-left-color: var(--faint); opacity: .75; }
+.hop.skipped .who { color: var(--dim); }
+.arrow.stepped .kind { color: var(--faint); }
 .arrow { display: flex; flex-direction: column; justify-content: center; align-items: center;
   padding: 0 .7rem; min-width: 8rem; }
 .arrow .kind { font: 600 .68rem/1 var(--mono); text-transform: uppercase; letter-spacing: .06em; }
@@ -182,6 +185,14 @@ const FAULT = {
   empty_completion: 'it answered with no text at all, and billed for it',
 }
 
+// Why a route was passed over without being called at all.
+const SKIP = {
+  circuit_open: 'the circuit breaker had it marked down',
+  budget: 'it has returned nothing at this token budget before',
+  stream_unsupported: 'it cannot stream, and this request asked to',
+  not_configured: 'it is in the signed policy but not in this gateway’s config',
+}
+
 /**
  * Parse X-Switchboard-Route into attempts.
  *
@@ -194,38 +205,61 @@ function parseRoute(header) {
   if (!header) return []
   return header.split(',').map((part) => {
     const raw = part.trim()
-    const m = raw.match(/^([^/:]+)(?:\/([^:]+))?:([0-9-]+)(?:\s+(.*))?$/)
-    if (!m) return { raw, provider: raw, model: '', status: '', fault: '' }
-    return { raw, provider: m[1], model: m[2] || '', status: m[3], fault: m[4] || '' }
+    const m = raw.match(/^([^/:]+)(?:\/([^:]+))?:(skipped|[0-9-]+)(?:\s+(.*))?$/)
+    if (!m) return { raw, provider: raw, model: '', status: '', fault: '', skipped: false }
+    const skipped = m[3] === 'skipped'
+    return {
+      raw, provider: m[1], model: m[2] || '',
+      status: skipped ? '' : m[3],
+      fault: skipped ? '' : (m[4] || ''),
+      skipped, reason: skipped ? (m[4] || '') : '',
+    }
   })
 }
 
-function renderChain(attempts) {
+function renderChain(steps) {
   const chain = $(`<div class="chain"></div>`)
-  attempts.forEach((a, i) => {
-    const last = i === attempts.length - 1
-    const hop = $(`<div class="hop ${last ? 'answered' : 'gaveup'}">
-      <div class="who">${esc(a.provider)}${a.model ? ' / ' + esc(a.model) : ''}</div>
-      <div class="what">${a.status === '-' ? 'no response' : 'HTTP ' + esc(a.status)}${
-        last ? ' — answered this request' : ''}</div>
-    </div>`)
-    hop.style.borderLeftColor = last ? 'var(--ok)' : 'var(--bad)'
-    if (!last) hop.style.borderLeftColor = 'var(--bad)'
-    chain.append(hop)
+  steps.forEach((a, i) => {
+    const last = i === steps.length - 1
 
-    if (!last) {
-      const next = attempts[i + 1]
-      // Same provider and model again is a retry of one route; a different
-      // provider is a failover to the next route in the policy. Both increment
-      // the attempt count, and they mean quite different things.
-      const isRetry = next.provider === a.provider && next.model === a.model
-      const why = a.fault ? (FAULT[a.fault] || a.fault.replace(/_/g, ' ')) : 'it did not answer usably'
-      chain.append($(`<div class="arrow ${isRetry ? 'retry' : 'failover'}">
-        <span class="kind">${isRetry ? 'retry' : 'failover'}</span>
-        <span class="line">&rarr;</span>
-        <span class="why">${esc(why)}</span>
+    if (a.skipped) {
+      // Not called at all, so not a failure and not an attempt. Drawn because
+      // leaving it out shows the successful half of a routing decision and
+      // hides the half that cost nothing -- which is the half worth paying for.
+      chain.append($(`<div class="hop skipped">
+        <div class="who">${esc(a.provider)}${a.model ? ' / ' + esc(a.model) : ''}</div>
+        <div class="what">not called — ${esc(SKIP[a.reason] || a.reason.replace(/_/g, ' '))}</div>
+        <div class="cost">no request sent, nothing billed</div>
+      </div>`))
+    } else {
+      chain.append($(`<div class="hop ${last ? 'answered' : 'gaveup'}">
+        <div class="who">${esc(a.provider)}${a.model ? ' / ' + esc(a.model) : ''}</div>
+        <div class="what">${a.status === '-' ? 'no response' : 'HTTP ' + esc(a.status)}${
+          last ? ' — answered this request' : ''}</div>
       </div>`))
     }
+
+    if (last) return
+    const next = steps[i + 1]
+
+    if (a.skipped) {
+      chain.append($(`<div class="arrow stepped">
+        <span class="kind">stepped over</span>
+        <span class="line">&rarr;</span>
+        <span class="why">no time and no tokens spent here</span>
+      </div>`))
+      return
+    }
+    // Same provider and model again is a retry of one route; a different
+    // provider is a failover to the next route in the policy. Both increment
+    // the attempt count, and they mean quite different things.
+    const isRetry = next.provider === a.provider && next.model === a.model
+    const why = a.fault ? (FAULT[a.fault] || a.fault.replace(/_/g, ' ')) : 'it did not answer usably'
+    chain.append($(`<div class="arrow ${isRetry ? 'retry' : 'failover'}">
+      <span class="kind">${isRetry ? 'retry' : 'failover'}</span>
+      <span class="line">&rarr;</span>
+      <span class="why">${esc(why)}</span>
+    </div>`))
   })
   return chain
 }
@@ -243,13 +277,26 @@ function render(res) {
     sec.append($(`<p class="lede">This request never reached a provider — the gateway
       answered it itself with HTTP ${res.status}. A policy refusal, an auth failure or a
       rate limit all end here, and none of them cost a token.</p>`))
-  } else if (attempts.length === 1) {
-    sec.append($(`<p class="lede">One provider, first time. No retry and no failover —
-      which is what most requests should look like.</p>`))
-    sec.append(renderChain(attempts))
   } else {
-    sec.append($(`<p class="lede">${attempts.length} attempts. Read it left to right: each
-      box is a provider that was asked, and each arrow says why the gateway moved on.</p>`))
+    const called = attempts.filter((a) => !a.skipped).length
+    const skipped = attempts.length - called
+    let lede
+    if (attempts.length === 1) {
+      lede = `One provider, first time. No retry and no failover — which is what most
+        requests should look like.`
+    } else if (skipped && called === 1) {
+      // The case the breaker produces, and the one worth spelling out: a route
+      // was passed over entirely, so this is not a failover at all.
+      lede = `${skipped} ${skipped === 1 ? 'route was' : 'routes were'} passed over without
+        being called, and one provider answered. That is not a failover: nothing was sent
+        to the ${skipped === 1 ? 'one that was skipped' : 'ones that were skipped'}, so it
+        cost no time and no tokens.`
+    } else {
+      lede = `${called} ${called === 1 ? 'provider was' : 'providers were'} called${
+        skipped ? ` and ${skipped} passed over without being called` : ''}. Read it left to
+        right: each arrow says why the gateway moved on.`
+    }
+    sec.append($(`<p class="lede">${lede}</p>`))
     sec.append(renderChain(attempts))
   }
 
