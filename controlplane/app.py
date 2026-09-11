@@ -12,7 +12,7 @@ import time
 import uuid
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -118,6 +118,56 @@ class EventBatch(Strict):
     # element is validated individually in the handler instead, where a failure
     # costs that event and nothing else.
     events: list[dict] = Field(min_length=1, max_length=200)
+
+class Annotation(Strict):
+    """A served-model change that was simulated, recorded by whatever simulated it.
+
+    Only the dev mock does that, and this is the only kind there is: see
+    migrations/005_annotations.sql for why the table refuses anything else. The
+    time is the database's, never the caller's."""
+    kind: Literal["simulated_served_model_change"]
+    provider: Literal["openai", "anthropic", "gemini", "bedrock"]
+    route_model: str = Field(pattern=ID.pattern)
+    served_model: str = Field(pattern=ID.pattern)
+    policy_version: int | None = Field(default=None, ge=1)
+    source: Literal["mockprovider"]
+
+
+# /v1/series groups by these and nothing else. Each is a fixed SQL fragment, so a
+# caller chooses among expressions rather than writing one.
+SERIES_DIMENSIONS = {
+    "provider": "nullif(event->>'provider','')",
+    # The model sent upstream by the attempt that ended the request.
+    "model": "event->'ext'->>'model'",
+    # What the caller asked for. The gateway writes requested_model only when it
+    # differs from model, so its absence means the two were the same.
+    "requested_model": "coalesce(event->'ext'->>'requested_model', event->'ext'->>'model')",
+    # What the provider said served the request. Never coalesced to model: NULL
+    # means the provider did not say, and filling it in would hide exactly the
+    # change this dimension exists to show.
+    "served_model": "event->'ext'->>'response_model'",
+    "policy_version": "event->>'policy_version'",
+    "fault": "event->'ext'->>'fault'",
+    "status": "event->>'status'",
+}
+_DURATION_MS = "(((event->>'end_ns')::bigint - (event->>'start_ns')::bigint) / 1e6)::float8"
+SERIES_MEASURES = {
+    "count": "count(*)",
+    "answered": "count(*) FILTER (WHERE (event->>'status')::int < 400)",
+    "failed_over": "count(*) FILTER (WHERE (event->>'attempts')::int > 1)",
+    # Requests that passed over at least one route without calling it.
+    "skipped": "count(*) FILTER (WHERE jsonb_typeof(event->'ext'->'skipped') = 'array')",
+    # NULL when nothing in the cell reported any, as in /v1/savings: silence, not zero.
+    "input_tokens": "sum((event->'ext'->>'gen_ai.usage.input_tokens')::bigint)",
+    "output_tokens": "sum((event->'ext'->>'gen_ai.usage.output_tokens')::bigint)",
+    "p50_ms": "percentile_cont(0.5) WITHIN GROUP (ORDER BY " + _DURATION_MS + ")",
+    "p95_ms": "percentile_cont(0.95) WITHIN GROUP (ORDER BY " + _DURATION_MS + ")",
+    "p99_ms": "percentile_cont(0.99) WITHIN GROUP (ORDER BY " + _DURATION_MS + ")",
+}
+SERIES_BUCKETS = (10, 30, 60, 300, 900, 1800, 3600, 10800, 21600, 86400)
+SERIES_MAX_BUCKETS = 360
+SERIES_CELL_LIMIT = 5000
+
 
 def require(principal: dict, *roles):
     if principal["role"] not in roles:
@@ -409,6 +459,9 @@ def create_app(pool=None, seed=None, key_id=None):
             """
             SELECT
               extract(epoch from received_at)                               AS at,
+              -- The gateway's own clock, for ordering and for any time axis. at
+              -- is when the batch arrived and is shared by every event in it.
+              (event->>'start_ns')::bigint                                  AS start_ns,
               coalesce(event->>'provider','')                               AS provider,
               coalesce(event->'ext'->>'model','')                           AS model,
               (event->>'status')::int                                       AS status,
@@ -435,7 +488,7 @@ def create_app(pool=None, seed=None, key_id=None):
               coalesce(event->'ext'->>'requested_model','')                  AS requested_model
             FROM telemetry
             WHERE received_at > now() - make_interval(hours => %s)
-            ORDER BY received_at DESC
+            ORDER BY received_at DESC, (event->>'start_ns')::bigint DESC
             LIMIT %s
             """,
             (hours, limit)).fetchall()
@@ -448,6 +501,137 @@ def create_app(pool=None, seed=None, key_id=None):
             # chart that lies by omission.
             "truncated": len(rows) >= limit,
             "rows": [dict(r) for r in rows],
+        }
+
+    @app.get("/v1/series")
+    def series(hours: int = 1, bucket: int = 0, by: str = "provider", measures: str = "count",
+               scope: str = "routed", where: list[str] = Query(default=[]),
+               s=Depends(session, scope="function")):
+        """Counts over time, grouped by one or two named dimensions.
+
+        Generic on purpose. Served-model drift, the model mix under each policy
+        version and a latency heatmap are each a bucketed count split by
+        something, and each is one query here rather than an endpoint of its own.
+
+        Bucketed on the gateway's start_ns, never on received_at. Telemetry
+        arrives in batches inserted in one transaction, and now() is fixed for a
+        transaction, so every event in a batch shares one received_at; binned on
+        that, a second of traffic -- or an outage's backlog -- lands on a single
+        instant. received_at still bounds the scan, because it is indexed: ingest
+        refuses an end_ns more than 60 seconds ahead of this clock, so an event
+        that started inside the window cannot have been received more than 60
+        seconds before the window opened, and widening the bound by that loses
+        nothing.
+
+        Everything the caller chooses selects a fixed fragment or binds a
+        parameter. Nothing the caller sends is written into the SQL.
+        """
+        db, p = s
+        require(p, "admin", "publisher", "viewer")
+        hours = max(1, min(hours, 24 * 31))
+        # No more than SERIES_MAX_BUCKETS, whatever was asked for, rounded up to a
+        # step a chart can label.
+        floor = max(10, -(-hours * 3600 // SERIES_MAX_BUCKETS))
+        step = next((b for b in SERIES_BUCKETS if b >= max(bucket, floor)), SERIES_BUCKETS[-1])
+
+        dims = [d for d in by.split(",") if d]
+        if not 1 <= len(dims) <= 2 or len(set(dims)) != len(dims) or any(d not in SERIES_DIMENSIONS for d in dims):
+            raise HTTPException(422, "by names one or two of: " + ", ".join(SERIES_DIMENSIONS))
+        names = ["count"] + [m for m in dict.fromkeys(measures.split(",")) if m and m != "count"]
+        if any(m not in SERIES_MEASURES for m in names):
+            raise HTTPException(422, "measures are drawn from: " + ", ".join(SERIES_MEASURES))
+        if scope not in ("routed", "all"):
+            raise HTTPException(422, "scope is routed or all")
+        if len(where) > 3:
+            raise HTTPException(422, "at most three where filters")
+
+        params = {"tenant": p["tenant_id"], "hours": hours, "bucket": step, "cap": SERIES_CELL_LIMIT + 1}
+        filters = ""
+        for i, w in enumerate(where):
+            dim, sep, value = w.partition(":")
+            if not sep or dim not in SERIES_DIMENSIONS or len(value) > 128:
+                raise HTTPException(422, "where is <dimension>:<value>, the value at most 128 characters")
+            filters += " AND " + SERIES_DIMENSIONS[dim] + " = %(w" + str(i) + ")s"
+            params["w" + str(i)] = value
+
+        keys = ", ".join(SERIES_DIMENSIONS[d] + " AS d" + str(i) for i, d in enumerate(dims))
+        values = ", ".join(SERIES_MEASURES[m] + " AS m" + str(i) for i, m in enumerate(names))
+        order = ", ".join(str(i + 2) for i in range(len(dims)))
+        rows = db.execute(
+            "SELECT extract(epoch FROM date_bin(make_interval(secs => %(bucket)s),"
+            " to_timestamp(((event->>'start_ns')::bigint / 1e9)::float8), TIMESTAMPTZ 'epoch'))::bigint AS t, "
+            + keys + ", " + values +
+            " FROM telemetry"
+            " WHERE tenant_id = %(tenant)s"
+            " AND received_at > now() - make_interval(hours => %(hours)s) - interval '60 seconds'"
+            " AND (event->>'start_ns')::bigint >= ((extract(epoch FROM now()) - %(hours)s * 3600) * 1e9)::bigint"
+            + (" AND event->>'provider' <> ''" if scope == "routed" else "")
+            + filters
+            + " GROUP BY 1, " + order + " ORDER BY 1, " + order + " LIMIT %(cap)s",
+            params).fetchall()
+        now = int(time.time())
+        return {
+            "window_hours": hours,
+            "bucket_seconds": step,
+            "time_basis": "start_ns",
+            "from": now - hours * 3600,
+            "to": now,
+            "by": dims,
+            "measures": names,
+            "cell_limit": SERIES_CELL_LIMIT,
+            # Said rather than silent, for the reason /v1/requests says it.
+            "truncated": len(rows) > SERIES_CELL_LIMIT,
+            "cells": [{"t": r["t"], "key": [r["d" + str(i)] for i in range(len(dims))],
+                       **{m: r["m" + str(i)] for i, m in enumerate(names)}}
+                      for r in rows[:SERIES_CELL_LIMIT]],
+        }
+
+    @app.post("/v1/annotations", status_code=201)
+    def annotation_create(body: Annotation, s=Depends(session, scope="function")):
+        """Record that a served-model change was simulated. Development stacks only.
+
+        404 anywhere else, not 403: a production control plane has no such
+        endpoint, and a publisher able to call it there could label a change a
+        provider really made as one somebody made on purpose."""
+        if os.getenv("SWITCHBOARD_DEV") != "1":
+            raise HTTPException(404, "not found")
+        db, p = s
+        require(p, "admin", "publisher")
+        detail = body.model_dump(exclude={"kind"})
+        row = db.execute(
+            "INSERT INTO annotations(tenant_id,kind,detail,principal_id) VALUES(%s,%s,%s,%s)"
+            " RETURNING id, extract(epoch from at) AS at",
+            (p["tenant_id"], body.kind, Jsonb(detail), p["id"])).fetchone()
+        audit(db, p, "annotation.create", {"id": row["id"], "kind": body.kind, **detail})
+        return {"id": row["id"], "at": row["at"], "kind": body.kind, **detail}
+
+    @app.get("/v1/annotations")
+    def annotation_list(hours: int = 24, s=Depends(session, scope="function")):
+        """Simulated changes in a window, and the policy versions published in it.
+
+        The policies include the last one published before the window opened,
+        because that is the one in force when it did."""
+        db, p = s
+        require(p, "admin", "publisher", "viewer")
+        hours = max(1, min(hours, 24 * 31))
+        simulated = db.execute(
+            """SELECT extract(epoch from at) AS at, kind, detail FROM annotations
+                WHERE tenant_id = %s AND at > now() - make_interval(hours => %s)
+                ORDER BY at""",
+            (p["tenant_id"], hours)).fetchall()
+        policies = db.execute(
+            """SELECT version, extract(epoch from created_at) AS published_at FROM policies
+                WHERE tenant_id = %(t)s
+                  AND (created_at > now() - make_interval(hours => %(h)s)
+                       OR version = (SELECT max(version) FROM policies
+                                      WHERE tenant_id = %(t)s
+                                        AND created_at <= now() - make_interval(hours => %(h)s)))
+                ORDER BY version""",
+            {"t": p["tenant_id"], "h": hours}).fetchall()
+        return {
+            "window_hours": hours,
+            "policies": [dict(r) for r in policies],
+            "simulated": [{"at": r["at"], "kind": r["kind"], **r["detail"]} for r in simulated],
         }
 
     @app.get("/v1/requests/{request_id}")

@@ -75,6 +75,9 @@ services:
       # ALLOW_LOCAL_HTTP is set; the app demands verify-full otherwise.
       DATABASE_URL: postgresql://switchboard_rt:${APP_DB_PASSWORD}@postgres:5432/switchboard
       ALLOW_LOCAL_HTTP: "true"
+      # Enables POST /v1/annotations, which dev-traffic uses to label the served
+      # model change it simulates. Absent in every deployed template.
+      SWITCHBOARD_DEV: "1"
     depends_on:
       taskns: {condition: service_started}
       dbinit: {condition: service_completed_successfully}

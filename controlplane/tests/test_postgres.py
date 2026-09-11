@@ -411,3 +411,182 @@ def test_unobserved_tokens_are_null_not_zero(setup):
         "a provider that reported 0 tokens must still read as 0. If this fails "
         "alongside the assertion above, absence and observed-zero have been "
         "collapsed in the other direction")
+
+
+def _event_at(start_ns, provider="openai", ext=None, attempts=1, status=200, policy_version=None):
+    """An event that started at a chosen moment, which _usage_event cannot express."""
+    event = {"id": secrets.token_hex(16), "request_id": secrets.token_hex(16),
+             "trace_id": secrets.token_hex(16), "span_id": secrets.token_hex(8),
+             "provider": provider, "status": status, "attempts": attempts,
+             "start_ns": start_ns, "end_ns": start_ns + 250_000_000, "ext": ext or {}}
+    if policy_version:
+        event["policy_version"] = policy_version
+    return event
+
+
+def _post(client, tokens, events, tenant="tenant-a"):
+    r = client.post("/v1/telemetry/batch", json={"events": events},
+                    headers=auth(tokens, tenant=tenant, role="agent"))
+    assert r.status_code == 200, r.text
+    assert len(r.json()["accepted"]) == len(events), r.text
+
+
+def _series(client, tokens, query, tenant="tenant-a"):
+    r = client.get("/v1/series?" + query, headers=auth(tokens, tenant=tenant, role="viewer"))
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _totals(cells, *measures):
+    """Sum cells by key across buckets, so a test does not depend on which bucket 'now' fell in."""
+    out = {}
+    for c in cells:
+        acc = out.setdefault(tuple(c["key"]), {m: 0 for m in measures})
+        for m in measures:
+            acc[m] += c[m]
+    return out
+
+
+def test_series_buckets_on_start_ns_not_received_at(setup):
+    """One batch, so one transaction and one received_at -- and still two buckets.
+
+    now() is fixed for the transaction that inserts a batch, so every event in it
+    shares received_at. Binned on that, these two events 25 seconds apart would
+    land in the same bucket and a chart would show a burst that never happened.
+    """
+    client, tokens, _ = setup
+    model = "series-bucket-" + secrets.token_hex(4)
+    base = (time.time_ns() // 10**10 - 30) * 10**10   # a 10-second boundary, five minutes ago
+    _post(client, tokens, [_event_at(base + 2 * 10**9, ext={"model": model}),
+                           _event_at(base + 27 * 10**9, ext={"model": model})])
+    got = _series(client, tokens, "hours=1&bucket=10&by=model&where=model:" + model)
+    assert got["bucket_seconds"] == 10 and got["time_basis"] == "start_ns", got
+    assert [(c["t"], c["count"]) for c in got["cells"]] == [(base // 10**9, 1), (base // 10**9 + 20, 1)], got
+
+
+def test_series_never_substitutes_the_request_model(setup):
+    """served_model is null when the provider did not say, never the model sent.
+
+    Filling it in would make a provider that stopped naming its model look
+    exactly like one that kept serving the model asked for.
+    """
+    client, tokens, _ = setup
+    model = "series-served-" + secrets.token_hex(4)
+    at = time.time_ns() - 60 * 10**9
+    _post(client, tokens, [_event_at(at, ext={"model": model, "response_model": model + "-snapshot"}),
+                           _event_at(at, ext={"model": model})])
+    got = _series(client, tokens, "hours=1&by=model,served_model&where=model:" + model)
+    assert _totals(got["cells"], "count") == {(model, model + "-snapshot"): {"count": 1},
+                                              (model, None): {"count": 1}}, got
+
+
+def test_series_groups_by_policy_version_and_counts_failover_and_skips(setup):
+    client, tokens, _ = setup
+    model = "series-policy-" + secrets.token_hex(4)
+    at = time.time_ns() - 60 * 10**9
+    skip = [{"order": 1, "provider": "gemini", "model": "g", "reason": "circuit_open"}]
+    _post(client, tokens, [
+        _event_at(at, ext={"model": model, "response_model": "a"}, policy_version=7),
+        _event_at(at, ext={"model": model, "response_model": "b", "skipped": skip}, attempts=2, policy_version=8),
+        _event_at(at, ext={"model": model}, status=503, attempts=3, policy_version=8),
+    ])
+    got = _series(client, tokens, "hours=1&by=policy_version&measures=answered,failed_over,skipped&where=model:" + model)
+    assert got["measures"] == ["count", "answered", "failed_over", "skipped"], got
+    assert _totals(got["cells"], "count", "answered", "failed_over", "skipped") == {
+        ("7",): {"count": 1, "answered": 1, "failed_over": 0, "skipped": 0},
+        ("8",): {"count": 2, "answered": 1, "failed_over": 2, "skipped": 1},
+    }, got
+
+
+def test_series_is_tenant_isolated(setup):
+    """A count that includes another tenant's traffic looks like a plausible number."""
+    client, tokens, _ = setup
+    model = "series-tenant-" + secrets.token_hex(4)
+    _post(client, tokens, [_event_at(time.time_ns() - 60 * 10**9, ext={"model": model})], tenant="tenant-b")
+    assert _series(client, tokens, "hours=1&by=model&where=model:" + model)["cells"] == []
+    b = _series(client, tokens, "hours=1&by=model&where=model:" + model, tenant="tenant-b")
+    assert sum(c["count"] for c in b["cells"]) == 1, b
+
+
+def test_series_is_bounded_allowlisted_and_role_gated(setup):
+    client, tokens, _ = setup
+    viewer = auth(tokens, role="viewer")
+    wide = client.get("/v1/series?hours=99999&by=provider", headers=viewer).json()
+    assert wide["window_hours"] == 24 * 31, wide
+    assert wide["bucket_seconds"] * 360 >= wide["window_hours"] * 3600, wide
+    assert client.get("/v1/series?hours=1&bucket=1&by=provider", headers=viewer).json()["bucket_seconds"] == 10
+    for q in ("by=event", "by=", "by=provider,provider", "by=provider,model,fault",
+              "by=provider&measures=sum(event)", "by=provider&scope=everything",
+              "by=provider&where=model", "by=provider&where=nope:x",
+              "by=provider&where=model:a&where=model:b&where=model:c&where=model:d"):
+        assert client.get("/v1/series?" + q, headers=viewer).status_code == 422, q
+    # A filter value is a bound parameter. This one matches nothing and breaks nothing.
+    r = client.get("/v1/series", params={"by": "model", "where": "model:x' OR '1'='1"}, headers=viewer)
+    assert r.status_code == 200 and r.json()["cells"] == [], r.text
+    # agent writes telemetry; reading it back aggregated is not its job.
+    assert client.get("/v1/series?by=provider", headers=auth(tokens, role="agent")).status_code == 403
+
+
+def test_series_window_is_decided_by_start_ns(setup):
+    """received_at bounds the scan; start_ns decides what is in the window.
+
+    Both events here are received now. One started half a minute inside the hour
+    and one half a minute before it, and only the first is in a one-hour series.
+    """
+    client, tokens, _ = setup
+    model = "series-window-" + secrets.token_hex(4)
+    now = time.time_ns()
+    _post(client, tokens, [_event_at(now - (3600 - 30) * 10**9, ext={"model": model, "response_model": "inside"}),
+                           _event_at(now - (3600 + 30) * 10**9, ext={"model": model, "response_model": "outside"})])
+    got = _series(client, tokens, "hours=1&by=served_model&where=model:" + model)
+    assert {c["key"][0] for c in got["cells"]} == {"inside"}, got
+
+
+def test_requests_projects_start_ns(setup):
+    client, tokens, _ = setup
+    model = "requests-start-" + secrets.token_hex(4)
+    start = time.time_ns() - 10**9
+    _post(client, tokens, [_event_at(start, ext={"model": model})])
+    rows = client.get("/v1/requests?hours=1&limit=5000", headers=auth(tokens, role="viewer")).json()["rows"]
+    mine = [r for r in rows if r["model"] == model]
+    assert mine and mine[0]["start_ns"] == start, mine
+
+
+def test_simulated_annotations_are_dev_only_audited_and_tenant_scoped(setup, monkeypatch):
+    client, tokens, _ = setup
+    body = {"kind": "simulated_served_model_change", "provider": "openai", "route_model": "gpt-4o-mini",
+            "served_model": "gpt-4o-mini-simulated-" + secrets.token_hex(3), "policy_version": 3,
+            "source": "mockprovider"}
+
+    # A production control plane has no such endpoint. A publisher able to call it
+    # there could label a change a provider really made as a deliberate one.
+    monkeypatch.delenv("SWITCHBOARD_DEV", raising=False)
+    assert client.post("/v1/annotations", json=body, headers=auth(tokens, role="admin")).status_code == 404
+
+    monkeypatch.setenv("SWITCHBOARD_DEV", "1")
+    for role in ("viewer", "agent"):
+        assert client.post("/v1/annotations", json=body, headers=auth(tokens, role=role)).status_code == 403, role
+    publisher = auth(tokens, role="publisher")
+    # The only kind there is, and the time is the database's.
+    assert client.post("/v1/annotations", json={**body, "kind": "observed_served_model_change"},
+                       headers=publisher).status_code == 422
+    assert client.post("/v1/annotations", json={**body, "at": 1}, headers=publisher).status_code == 422
+    assert client.post("/v1/annotations", json={**body, "served_model": "has spaces"},
+                       headers=publisher).status_code == 422
+
+    r = client.post("/v1/annotations", json=body, headers=publisher)
+    assert r.status_code == 201, r.text
+    created = r.json()
+
+    listed = client.get("/v1/annotations?hours=1", headers=auth(tokens, role="viewer")).json()
+    assert any(a["served_model"] == body["served_model"] and a["route_model"] == "gpt-4o-mini"
+               and a["kind"] == body["kind"] for a in listed["simulated"]), listed
+    assert "policies" in listed, listed
+
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"], row_factory=dict_row) as db:
+        audited = db.execute("SELECT tenant_id, detail FROM audit WHERE action = 'annotation.create'"
+                             " AND detail->>'id' = %s", (str(created["id"]),)).fetchall()
+    assert [a["tenant_id"] for a in audited] == ["tenant-a"], audited
+
+    other = client.get("/v1/annotations?hours=1", headers=auth(tokens, tenant="tenant-b", role="viewer")).json()
+    assert all(a["served_model"] != body["served_model"] for a in other["simulated"]), other
