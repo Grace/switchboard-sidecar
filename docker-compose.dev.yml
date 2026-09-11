@@ -87,6 +87,10 @@ services:
     environment:
       MOCK_HOST: 127.0.0.1
       MOCK_PORT: "9090"
+      # POST /control changes the model this mock says served a response, which
+      # is how dev-traffic's drift phase simulates a provider moving an alias to
+      # a new snapshot. Not set on brokenprovider, which only ever fails.
+      MOCK_CONTROL: "1"
     command: ["python", "/scripts/mockprovider.py"]
     depends_on:
       taskns: {condition: service_started}
