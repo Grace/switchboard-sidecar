@@ -64,7 +64,7 @@ class Fatal(SystemExit):
         super().__init__(f"honeycomb: {msg}")
 
 
-def api(key: str, method: str, path: str, body=None):
+def api(key: str, method: str, path: str, body=None, missing_ok: bool = False):
     """One HTTP call, with the server's own error text preserved.
 
     urllib raises HTTPError before a caller can read the body, and the body is
@@ -82,6 +82,9 @@ def api(key: str, method: str, path: str, body=None):
             raw = r.read()
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
+        if missing_ok and e.code == 404:
+            # For a lookup where absence is an answer rather than a failure.
+            return None
         detail = e.read().decode(errors="replace").strip()
         try:
             parsed = json.loads(detail)
@@ -311,14 +314,53 @@ def board_queries() -> list[tuple[str, str, dict]]:
     return out
 
 
+# Request spans only, answered, and only ones that reached a provider. The
+# gateway is gaining a child span per attempt, which would also carry
+# gen_ai.response.model and double every count; switchboard.attempts is written
+# on the request span alone, so it is what tells the two apart. A request
+# refused before routing never had a model served.
+SPAN_FILTERS = (
+    {"column": "switchboard.attempts", "op": "exists"},
+    {"column": "gen_ai.provider.name", "op": "exists"},
+    {"column": "http.response.status_code", "op": "<", "value": 400},
+)
+
+
+def span_queries() -> list[tuple[str, str, dict]]:
+    """The span panels from alerting.py, as queries on the traces dataset.
+
+    COUNT and COUNT_DISTINCT only. Two hours rather than the counters' day,
+    because the question is whether the served model changed recently.
+    """
+    out = []
+    for p in alerting.SPAN_PANELS:
+        if p.measure == "count":
+            calc = {"op": "COUNT"}
+        else:
+            calc = {"op": "COUNT_DISTINCT", "column": p.measure.split(":", 1)[1]}
+        out.append((p.title, p.caption, {
+            "calculations": [calc],
+            "breakdowns": list(p.group_by),
+            "filters": [dict(f) for f in SPAN_FILTERS],
+            "filter_combination": "AND",
+            "time_range": 7200,
+        }))
+    return out
+
+
 BOARD_TEXT = alerting.OVERVIEW + """
 
 The triggers on this environment cover those conditions in two slots, because the Honeycomb free
 plan allows two triggers in total. The page names its own cause; the notify trigger sums several
-counters and cannot say which moved, so the first panel below is the answer."""
+counters and cannot say which moved, so the first panel below is the answer.
+
+The served-model panels read the gateway's request spans rather than these counters: which model a
+provider said answered each request. A blank served model means the provider did not say. Markers
+of type `simulated` were placed by the development traffic script when it made its mock provider
+answer as a different model; they label an injected change, never a real one."""
 
 
-def existing_columns(key: str, dataset: str) -> set[str]:
+def existing_columns(key: str, dataset: str) -> set[str] | None:
     """Every column name the dataset has actually received data for.
 
     Honeycomb refuses to store a query naming a column it has never seen --
@@ -331,14 +373,21 @@ def existing_columns(key: str, dataset: str) -> set[str]:
     environment is empty until their gateway sends something, so on a fresh
     environment every panel would be refused and the whole run would abort.
     """
-    listed = api(key, "GET", f"/1/columns/{dataset}") or []
-    return {c.get("key_name") for c in listed if c.get("key_name")}
+    # None, not an empty set, when the dataset does not exist at all. The traces
+    # dataset is created by the first span a gateway exports, so on a fresh
+    # environment it is simply absent -- which has to skip its panels, not abort
+    # a run that has already written the triggers.
+    listed = api(key, "GET", f"/1/columns/{dataset}", missing_ok=True)
+    if listed is None:
+        return None
+    return {c.get("key_name") for c in listed or [] if c.get("key_name")}
 
 
 def columns_used(spec: dict) -> set[str]:
-    """The columns a query spec names, across calculations and breakdowns."""
+    """The columns a query spec names, across calculations, breakdowns and filters."""
     out = {c["column"] for c in spec.get("calculations", []) if c.get("column")}
     out |= set(spec.get("breakdowns") or [])
+    out |= {f["column"] for f in spec.get("filters") or [] if f.get("column")}
     return out
 
 
@@ -412,7 +461,21 @@ def run_query(key: str, dataset: str, query_id: str, name: str):
     raise Fatal(f"query for {name!r} did not complete; treat the trigger as unverified")
 
 
-def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) -> int:
+def marker(key: str, message: str, kind: str, url: str | None = None) -> dict:
+    """Put an environment-wide marker on every chart, at now.
+
+    ``__all__`` rather than one dataset, because what it marks shows in both the
+    metrics and the request spans. Not part of apply(): a marker records that
+    something happened, and provisioning is not something happening. Needs the
+    key's Markers permission, which apply() does not."""
+    body = {"message": message, "type": kind}
+    if url:
+        body["url"] = url
+    return api(key, "POST", "/1/markers/__all__", body)
+
+
+def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False,
+          traces_dataset: str = "switchboard-gateway") -> int:
     """Reconcile the account against the definitions above.
 
     --dry-run exists because the honest way to check a provisioning tool is to
@@ -496,20 +559,29 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
             "text_panel": {"content": BOARD_TEXT},
         }
     ]
-    have = existing_columns(key, dataset)
-    panels_wanted = board_queries()
+    # Each panel is checked against the dataset it queries. The check used to run
+    # only `if have`, so a dataset that existed with no columns kept every panel
+    # and each was refused with a 422; and a dataset that did not exist raised,
+    # aborting the run after the triggers were already written.
+    wanted = [(name, desc, spec, dataset) for name, desc, spec in board_queries()]
+    if traces_dataset:
+        wanted += [(name, desc, spec, traces_dataset) for name, desc, spec in span_queries()]
+    columns = {}
+    panels_wanted = []
     skipped = []
-    if have:
-        keep = []
-        for entry in panels_wanted:
-            missing = sorted(columns_used(entry[2]) - have)
-            if missing:
-                skipped.append((entry[0], missing))
-            else:
-                keep.append(entry)
-        panels_wanted = keep
+    for name, desc, spec, ds in wanted:
+        if ds not in columns:
+            columns[ds] = existing_columns(key, ds)
+        if columns[ds] is None:
+            skipped.append((name, [f"dataset {ds} does not exist yet"]))
+            continue
+        missing = sorted(columns_used(spec) - columns[ds])
+        if missing:
+            skipped.append((name, missing))
+        else:
+            panels_wanted.append((name, desc, spec, ds))
 
-    for i, (name, desc, spec) in enumerate(panels_wanted):
+    for i, (name, desc, spec, ds) in enumerate(panels_wanted):
         # Behind write(), not around it. A board panel needs a saved query and
         # an annotation to point at, and creating those is as much a write as
         # creating the board: they are named objects that persist in the
@@ -517,10 +589,10 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
         # during a dry run left five orphaned annotations per run and printed
         # nothing about it, which makes a flag documented as "writing nothing"
         # a false statement rather than an imprecise one.
-        q = write("create query", name, lambda spec=spec:
-                  api(key, "POST", f"/1/queries/{dataset}", spec))
-        ann = write("create query annotation", name, lambda name=name, desc=desc, q=q:
-                    api(key, "POST", f"/1/query_annotations/{dataset}",
+        q = write("create query", name, lambda spec=spec, ds=ds:
+                  api(key, "POST", f"/1/queries/{ds}", spec))
+        ann = write("create query annotation", name, lambda name=name, desc=desc, q=q, ds=ds:
+                    api(key, "POST", f"/1/query_annotations/{ds}",
                         {"name": name, "description": desc, "query_id": q["id"]}))
         if q is None or ann is None:
             # Dry run: there is no id to build a panel around, and inventing a
@@ -611,6 +683,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--dataset", default="Metrics",
                     help="dataset holding the switchboard.* counters (default: Metrics)")
+    ap.add_argument("--traces-dataset", default="switchboard-gateway",
+                    help="dataset holding the gateway's request spans, for the served-model panels "
+                         "(default: switchboard-gateway, the service.name the gateway exports "
+                         "under); pass an empty string to leave those panels off")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--recipient", help="email address the triggers notify")
     g.add_argument("--no-recipient", action="store_true",
@@ -641,7 +717,7 @@ def main(argv: list[str] | None = None) -> int:
             "  Not HONEYCOMB_API_KEY: that one holds the ingest key the gateway itself reads,\n"
             "  and a configuration key there would let the data plane edit its own alerting."
         )
-    return apply(key, a.dataset, None if a.no_recipient else a.recipient, a.dry_run)
+    return apply(key, a.dataset, None if a.no_recipient else a.recipient, a.dry_run, a.traces_dataset)
 
 
 if __name__ == "__main__":

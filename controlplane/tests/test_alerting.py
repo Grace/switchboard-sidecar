@@ -49,6 +49,33 @@ def gateway_histograms() -> set[str]:
     return set(re.findall(r'"name": "(gen_ai\.[a-z_.]+)"', block))
 
 
+def span_attributes() -> set[str]:
+    """Every attribute key spanOf in telemetry.go writes by name.
+
+    The span counterpart of gateway_series(). Usage counts are written through a
+    table rather than literally and are not collected, which is fine: no span
+    panel reads them.
+    """
+    src = (REPO / "internal/gateway/telemetry.go").read_text()
+    block = src[src.index("func (t *Telemetry) spanOf("):src.index("func (t *Telemetry) exportOTLP(")]
+    return set(re.findall(r'"key": "([a-z_.]+)"', block))
+
+
+def test_span_panels_name_attributes_the_gateway_writes():
+    """A panel over an attribute the span never carries is a board that stays
+    empty and reads as nothing having happened -- the counter-name drift this
+    file already guards against, for spans."""
+    written = span_attributes()
+    assert "gen_ai.response.model" in written, "the served model is no longer on the span"
+    for panel in alerting.SPAN_PANELS:
+        needed = set(panel.group_by)
+        if panel.measure.startswith("distinct:"):
+            needed.add(panel.measure.split(":", 1)[1])
+        else:
+            assert panel.measure == "count", panel
+        assert needed <= written, (panel.title, sorted(needed - written))
+
+
 def referenced() -> set[str]:
     names = {c.metric for c in alerting.CONDITIONS}
     names |= {m for p in alerting.PANELS for m in p.metrics}

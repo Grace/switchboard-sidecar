@@ -176,6 +176,64 @@ PANELS = (
     ),
 )
 
+class SpanPanel(NamedTuple):
+    """A question answered from the gateway's request spans rather than its counters.
+
+    ``group_by`` and the attribute inside ``measure`` are full span attribute
+    names, not suffixes: they follow the GenAI conventions where one applies and
+    the gateway's own namespace where none does, and no emitter prefixes them.
+    ``measure`` is ``count`` or ``distinct:<attribute>``.
+    """
+
+    title: str
+    group_by: tuple[str, ...]
+    measure: str
+    caption: str
+
+
+SENT_MODEL = "gen_ai.request.model"
+SERVED_MODEL = "gen_ai.response.model"
+
+# Served-model drift: a provider answering a request for one model with another.
+#
+# Deliberately not alerted. The two trigger slots the Honeycomb free plan allows
+# are taken by the page and the combined notify, and neither should give way;
+# and providers move aliases to new snapshots as a matter of course, so "the
+# served model changed" is something to see on a graph and look into, not
+# something to wake anyone for. Written here rather than in NOT_ALERTED, whose
+# keys are counter names.
+SPAN_PANELS = (
+    SpanPanel(
+        title="Served model under each sent model",
+        group_by=(SENT_MODEL, SERVED_MODEL),
+        measure="count",
+        caption=(
+            "Answered requests, split by the model sent and the model the provider said served "
+            "it. A new served value under an unchanged sent model is a provider moving an alias. "
+            "A blank served value means the provider did not say, which Bedrock never does."
+        ),
+    ),
+    SpanPanel(
+        title="Distinct served models per sent model",
+        group_by=(SENT_MODEL,),
+        measure="distinct:" + SERVED_MODEL,
+        caption=(
+            "How many different models answered for each model sent. A step from one to two is "
+            "the moment a snapshot changed. Blanks are not counted, so a provider that stops "
+            "naming its model shows only in the panel above."
+        ),
+    ),
+    SpanPanel(
+        title="Answers by served model, per policy version",
+        group_by=("switchboard.policy_version", SERVED_MODEL),
+        measure="count",
+        caption=(
+            "The mix of models that answered under each signed policy. A shift inside one version "
+            "is the providers or the circuit breaker; a shift at a version boundary is the policy."
+        ),
+    ),
+)
+
 # The latency histogram is named separately because it is not a counter and the
 # emitters aggregate it differently. Its percentiles are not currently
 # trustworthy: traffic below the lowest bucket bound lands in a bucket with no

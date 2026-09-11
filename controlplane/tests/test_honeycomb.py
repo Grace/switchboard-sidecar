@@ -177,10 +177,16 @@ def test_recipient_choice_must_be_explicit(capsys):
         main(["--dataset", "Metrics"])
 
 
+# Every column any board or span panel names, so a FakeAPI with no column list
+# describes an account whose data has all arrived.
+ALL_COLUMNS = set().union(*(honeycomb.columns_used(q)
+                            for _, _, q in board_queries() + honeycomb.span_queries()))
+
+
 class FakeAPI:
     """Records every call so a test can assert what a dry run did NOT do."""
 
-    def __init__(self, access=None, triggers=(), boards=(), recipients=()):
+    def __init__(self, access=None, triggers=(), boards=(), recipients=(), columns=None):
         self.calls = []
         self.access = access or {"triggers": True, "boards": True,
                                  "recipients": True, "queries": True}
@@ -191,9 +197,26 @@ class FakeAPI:
         # matches an existing one was never exercised and a real bug lived behind
         # it for as long as the tool has existed.
         self.recipients = list(recipients)
+        # None: every column any panel needs exists in every dataset. A dict maps
+        # a dataset to the columns it has, and a dataset missing from it is a 404.
+        # Every test used to run against a column lookup that returned nothing,
+        # which the old check read as "keep every panel" -- so the 422 an empty
+        # dataset really produces was never exercised.
+        self.columns = columns
 
-    def __call__(self, key, method, path, body=None):
+    def __call__(self, key, method, path, body=None, missing_ok=False):
         self.calls.append((method, path))
+        if path.startswith("/1/columns/"):
+            ds = path.rsplit("/", 1)[1]
+            if self.columns is None:
+                return [{"key_name": c} for c in sorted(ALL_COLUMNS)]
+            if ds not in self.columns:
+                if missing_ok:
+                    return None
+                raise honeycomb.Fatal(f"GET {path} -> 404: dataset not found")
+            return [{"key_name": c} for c in self.columns[ds]]
+        if path.startswith("/1/markers/"):
+            return {"id": "m1"}
         if path == "/1/auth":
             return {"type": "configuration", "team": {"slug": "t"},
                     "environment": {"slug": "e"}, "api_key_access": self.access}
@@ -348,7 +371,7 @@ def test_an_already_provisioned_account_creates_nothing_new(monkeypatch, capsys)
 def test_trigger_recipients_are_objects_not_ids(monkeypatch):
     sent = []
 
-    def fake(key, method, path, body=None):
+    def fake(key, method, path, body=None, missing_ok=False):
         if path == "/1/auth":
             return {"type": "configuration", "team": {"slug": "t"},
                     "environment": {"slug": "e"},
@@ -380,3 +403,104 @@ def test_trigger_recipients_are_objects_not_ids(monkeypatch):
         for r in body["recipients"]:
             assert isinstance(r, dict), f"recipient sent as {type(r).__name__}: {r!r}"
             assert r.get("id"), f"recipient object carries no id: {r!r}"
+
+
+def test_span_queries_count_answered_requests_on_request_spans_only():
+    """Answered requests that reached a provider, each counted once.
+
+    switchboard.attempts is on the request span and not on a per-attempt child
+    span, which would otherwise carry gen_ai.response.model too and double every
+    count on the board."""
+    queries = honeycomb.span_queries()
+    assert [name for name, _, _ in queries] == [p.title for p in alerting.SPAN_PANELS]
+    for name, desc, q in queries:
+        assert len(desc) > 40, name
+        assert calc_ops(q) <= {"COUNT", "COUNT_DISTINCT"}, name
+        filters = {f["column"]: f for f in q["filters"]}
+        assert filters["switchboard.attempts"]["op"] == "exists", name
+        assert filters["gen_ai.provider.name"]["op"] == "exists", name
+        assert filters["http.response.status_code"] == {
+            "column": "http.response.status_code", "op": "<", "value": 400}, name
+        assert q["filter_combination"] == "AND", name
+        named = q["breakdowns"] + [c.get("column") for c in q["calculations"]]
+        assert "gen_ai.response.model" in named, name
+
+
+def test_span_panels_are_queried_on_the_traces_dataset(monkeypatch, capsys):
+    fake = FakeAPI()
+    monkeypatch.setattr(honeycomb, "api", fake)
+    honeycomb.apply("k", "Metrics", None, dry_run=False)
+    posts = [p for m, p in fake.writes() if p.startswith("/1/queries/")]
+    assert posts.count("/1/queries/switchboard-gateway") == len(alerting.SPAN_PANELS), posts
+    assert posts.count("/1/queries/Metrics") == len(board_queries()), posts
+    assert ("POST", "/1/query_annotations/switchboard-gateway") in fake.writes()
+
+
+def test_a_missing_traces_dataset_skips_its_panels_and_still_provisions(monkeypatch, capsys):
+    """The traces dataset exists only once a gateway has exported a span. Before
+    that, its column lookup raised, and the run stopped after the triggers had
+    already been written."""
+    metric_columns = set().union(*(honeycomb.columns_used(q) for _, _, q in board_queries()))
+    fake = FakeAPI(columns={"Metrics": sorted(metric_columns)})
+    monkeypatch.setattr(honeycomb, "api", fake)
+    assert honeycomb.apply("k", "Metrics", None, dry_run=False) == 0
+    paths = [p for _, p in fake.writes()]
+    assert any(p.startswith("/1/triggers") for p in paths)
+    assert "/1/boards" in paths
+    assert "/1/queries/switchboard-gateway" not in paths
+    out = capsys.readouterr().out
+    assert "dataset switchboard-gateway does not exist yet" in out
+    for p in alerting.SPAN_PANELS:
+        assert p.title in out, "every panel left off must be named"
+
+
+def test_an_empty_dataset_skips_every_panel_instead_of_posting_them(monkeypatch, capsys):
+    """An empty column set used to mean "keep everything" -- the check ran only
+    `if have` -- so every panel was posted to a dataset that refuses queries over
+    columns it has never seen, and each came back 422."""
+    fake = FakeAPI(columns={"Metrics": [], "switchboard-gateway": []})
+    monkeypatch.setattr(honeycomb, "api", fake)
+    assert honeycomb.apply("k", "Metrics", None, dry_run=False) == 0
+    paths = [p for _, p in fake.writes()]
+    assert not any(p.startswith("/1/queries") for p in paths), paths
+    assert "/1/boards" in paths, "the board and its text panel still go out"
+
+
+def test_served_model_panels_wait_for_the_served_model_column(monkeypatch, capsys):
+    """Spans from a gateway that predates the served model carry no such column."""
+    columns = sorted(ALL_COLUMNS - {"gen_ai.response.model"})
+    fake = FakeAPI(columns={"Metrics": columns, "switchboard-gateway": columns})
+    monkeypatch.setattr(honeycomb, "api", fake)
+    honeycomb.apply("k", "Metrics", None, dry_run=False)
+    assert "/1/queries/switchboard-gateway" not in [p for _, p in fake.writes()]
+    assert "gen_ai.response.model" in capsys.readouterr().out
+
+
+def test_the_span_panels_can_be_left_off(monkeypatch, capsys):
+    fake = FakeAPI()
+    monkeypatch.setattr(honeycomb, "api", fake)
+    honeycomb.apply("k", "Metrics", None, dry_run=False, traces_dataset="")
+    # Every query went to the metrics dataset, and nothing else was looked up.
+    # Checking only that "switchboard-gateway" never appeared passed while span
+    # queries were still being posted -- to "/1/queries/", with an empty dataset.
+    posts = [p for m, p in fake.writes() if p.startswith("/1/queries/")]
+    assert posts == ["/1/queries/Metrics"] * len(board_queries()), posts
+    assert [p for _, p in fake.calls if p.startswith("/1/columns/")] == ["/1/columns/Metrics"]
+
+
+def test_markers_are_environment_wide(monkeypatch):
+    """One marker shows on both the counters and the spans."""
+    sent = []
+
+    def fake(key, method, path, body=None, missing_ok=False):
+        sent.append((method, path, body))
+        return {"id": "m1"}
+
+    monkeypatch.setattr(honeycomb, "api", fake)
+    honeycomb.marker("k", "SIMULATED by mockprovider", "simulated")
+    honeycomb.marker("k", "policy v8 published", "policy-publish", url="http://127.0.0.1:18000/v1/policy")
+    assert sent == [
+        ("POST", "/1/markers/__all__", {"message": "SIMULATED by mockprovider", "type": "simulated"}),
+        ("POST", "/1/markers/__all__", {"message": "policy v8 published", "type": "policy-publish",
+                                        "url": "http://127.0.0.1:18000/v1/policy"}),
+    ]
