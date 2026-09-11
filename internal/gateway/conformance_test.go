@@ -37,6 +37,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -133,20 +134,34 @@ func TestSpansAreConformantAccordingToInterlingua(t *testing.T) {
 	// error.type, a request that never reached a provider and so has no model or
 	// usage, and a cached Anthropic call, which is the only one that fills the
 	// cache attributes.
+	//
+	// Built through the same beginTry/recordUsage/endTry calls the routing loop
+	// makes, rather than by filling Event's fields in directly. A hand-filled
+	// Event can describe a span server.go never produces, and then this test
+	// would be checking a shape that does not exist.
+	mk := func(provider, model string, status int, fault string, tries []tokenUsage) Event {
+		e := Event{TraceID: "t", SpanID: "s", Status: status, Start: 1, End: 2, Fault: fault}
+		for i, u := range tries {
+			e.Attempts++
+			e.Provider, e.Model = provider, model
+			e.beginTry(provider, model, 1, "c"+strconv.Itoa(i+1))
+			e.recordUsage(u)
+			e.endTry(status, fault, 2)
+		}
+		return e
+	}
 	events := []Event{
-		{TraceID: "t", SpanID: "s", Provider: "openai", Model: "gpt-5-nano", Status: 200,
-			Start: 1, End: 2, Attempts: 1, Usage: tokenUsage{Input: 30, Output: 12, Reasoning: 8}},
-		{TraceID: "t", SpanID: "s", Provider: "anthropic", Model: "claude-haiku-4-5", Status: 200,
-			Start: 1, End: 2, Attempts: 1, Usage: tokenUsage{Input: 100050, Output: 7, CacheRead: 100000}},
-		{TraceID: "t", SpanID: "s", Provider: "gemini", Model: "gemini-3.6-flash", Status: 200,
-			Start: 1, End: 2, Attempts: 2},
-		{TraceID: "t", SpanID: "s", Provider: "bedrock", Model: "claude-sonnet-4", Status: 503,
-			Start: 1, End: 2, Attempts: 3, Fault: faultDegraded.String()},
+		mk("openai", "gpt-5-nano", 200, "", []tokenUsage{{Input: 30, Output: 12, Reasoning: 8}}),
+		mk("anthropic", "claude-haiku-4-5", 200, "", []tokenUsage{{Input: 100050, Output: 7, CacheRead: 100000}}),
+		mk("gemini", "gemini-3.6-flash", 200, "", []tokenUsage{{}, {}}),
+		mk("bedrock", "claude-sonnet-4", 503, faultDegraded.String(), []tokenUsage{{}, {}, {}}),
 		{TraceID: "t", SpanID: "s", Provider: "", Status: 403, Start: 1, End: 2},
 	}
-	spans := make([]any, 0, len(events))
+	// Every span of every request, which is now more than one per request: the
+	// routing span, and one per upstream call.
+	var spans []any
 	for _, e := range events {
-		spans = append(spans, tel.spanOf(e))
+		spans = append(spans, tel.spansOf(e)...)
 	}
 	export := map[string]any{"resourceSpans": []any{map[string]any{
 		"resource":   map[string]any{"attributes": []any{}},
@@ -154,41 +169,52 @@ func TestSpansAreConformantAccordingToInterlingua(t *testing.T) {
 	}}}
 
 	got := normalizeThroughInterlingua(t, bin, export)
-	if len(got) != len(events) {
-		t.Fatalf("got %d spans back, sent %d", len(got), len(events))
+	if len(got) != len(spans) {
+		t.Fatalf("got %d spans back, sent %d", len(got), len(spans))
 	}
+	attempts := 0
 	for i, span := range got {
 		dialect, lossy := verdict(span)
+		name, _ := span["name"].(string)
 
-		// A request that never reached a provider is not a GenAI operation, so it
-		// carries no gen_ai.* at all and interlingua rightly declines to classify
-		// it. The invariant there is the absence, not the verdict.
-		if events[i].Provider == "" {
+		// The routing span is not a GenAI operation -- it is the thing that chose
+		// one -- so it carries no gen_ai.* at all and interlingua rightly declines
+		// to classify it. Same for a request that reached no provider. The
+		// invariant for both is the absence, not the verdict.
+		//
+		// This is also what stops the token counts being double-counted: if a
+		// routing span ever regrows gen_ai.usage.*, this fails.
+		if strings.HasPrefix(name, "switchboard.") {
 			for _, a := range span["attributes"].([]any) {
 				if k := a.(map[string]any)["key"].(string); strings.HasPrefix(k, "gen_ai.") {
-					t.Errorf("span %d reached no provider yet claims %s", i, k)
+					t.Errorf("span %d (%s) is a routing span yet claims %s", i, name, k)
 				}
 			}
 			if dialect != "" {
-				t.Errorf("span %d reached no provider yet was classified as %q", i, dialect)
+				t.Errorf("span %d (%s) is a routing span yet was classified as %q", i, name, dialect)
 			}
 			continue
 		}
+		attempts++
 
 		// "raw" is its name for a span already in the conventions' vocabulary.
 		// Anything else means it recognised this gateway's output as some other
 		// library's dialect, which would be a finding in itself.
 		if dialect != "raw" {
-			t.Errorf("span %d (%s): detected as dialect %q, want \"raw\"",
-				i, events[i].Provider, dialect)
+			t.Errorf("span %d (%s): detected as dialect %q, want \"raw\"", i, name, dialect)
 		}
 		// The assertion that matters. Each entry is a key this span does not
 		// faithfully carry -- and an off-enum gen_ai.provider.name lands here.
 		if len(lossy) > 0 {
-			t.Errorf("span %d (provider=%q model=%q status=%d): interlingua reports it is not a "+
-				"faithful carrier of %v\n  That is a conformance defect in this gateway, found by a "+
-				"tool that has never heard of it.",
-				i, events[i].Provider, events[i].Model, events[i].Status, lossy)
+			t.Errorf("span %d (%s): interlingua reports it is not a faithful carrier of %v\n  "+
+				"That is a conformance defect in this gateway, found by a tool that has never "+
+				"heard of it.", i, name, lossy)
 		}
+	}
+	// Seven upstream calls across the five requests. Asserted so that a change
+	// which stopped emitting attempt spans entirely would fail here rather than
+	// pass by having nothing left to check.
+	if want := 7; attempts != want {
+		t.Errorf("checked %d attempt spans, want %d", attempts, want)
 	}
 }

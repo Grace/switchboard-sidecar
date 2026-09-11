@@ -1338,7 +1338,7 @@ func (t *Telemetry) exportOTLPBatch(ctx context.Context, events []Event) {
 	}
 	spans := make([]any, 0, len(events))
 	for _, e := range events {
-		spans = append(spans, t.spanOf(e))
+		spans = append(spans, t.spansOf(e)...)
 	}
 	t.postSpans(ctx, spans)
 }
@@ -1545,8 +1545,105 @@ func semconvOf(provider string) semconv {
 	return semconv{provider, "chat"}
 }
 
+// spansOf is one request's whole trace: the routing span, and one span per
+// upstream call it made.
+//
+// Split this way because they answer different questions and a single span
+// could only answer one of them. The parent says what the gateway decided; the
+// children say what each provider was asked and what it charged. Before this,
+// a request that failed over exported one span naming the provider that
+// answered and carrying the sum of every attempt's tokens -- so the provider
+// that served 612 input tokens was recorded as having consumed 1,098, and every
+// backend that groups cost by gen_ai.provider.name inherited the error.
+//
+// conformance_test.go did not catch it and never could have: every key was
+// spelled correctly. It is an attribution defect rather than a vocabulary one,
+// which is exactly the class an independent normalizer cannot see.
+func (t *Telemetry) spansOf(e Event) []any {
+	spans := make([]any, 0, 1+len(e.Tries))
+	spans = append(spans, t.spanOf(e))
+	for _, try := range e.Tries {
+		spans = append(spans, t.attemptSpanOf(e, try))
+	}
+	return spans
+}
+
+// attemptSpanOf is one upstream call: the span the GenAI conventions are about.
+//
+// The span id was minted at beginTry and, until now, went no further than the
+// control-plane event -- every exit path from an attempt already referred to it,
+// and nothing ever exported a span to match.
+func (t *Telemetry) attemptSpanOf(e Event, try attemptRecord) map[string]any {
+	sc := semconvOf(try.Provider)
+	attrs := []any{
+		map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": sc.provider}},
+		map[string]any{"key": "gen_ai.operation.name", "value": map[string]any{"stringValue": sc.operation}},
+		map[string]any{"key": "gen_ai.request.model", "value": map[string]any{"stringValue": try.Model}},
+		// Which attempt this was, so a trace can be read without comparing
+		// timestamps. 1-based, and counting only calls that were made, unlike
+		// Order, which interleaves the routes that were stepped over.
+		//
+		// Named .seq rather than .attempt so that it cannot be confused with the
+		// request span's switchboard.attempts, which differs by one letter and is
+		// what board queries use to tell a request span from an attempt span. Two
+		// attributes one character apart, meaning different things, on spans in
+		// the same trace, is a mistake waiting to be made by someone reading a
+		// query six months from now.
+		map[string]any{"key": "switchboard.attempt.seq", "value": map[string]any{"intValue": strconv.Itoa(try.Seq)}},
+	}
+	// Status 0 means the call never returned one -- a timeout, a cancelled
+	// context, a connection that failed. Writing 0 would claim an HTTP status
+	// that was never received, which is the blank-versus-zero mistake this
+	// repository has now made twice elsewhere.
+	if try.Status != 0 {
+		attrs = append(attrs, map[string]any{"key": "http.response.status_code", "value": map[string]any{"intValue": strconv.Itoa(try.Status)}})
+	}
+	if try.Fault != "" {
+		attrs = append(attrs, map[string]any{"key": "switchboard.fault", "value": map[string]any{"stringValue": try.Fault}})
+	}
+	// This attempt's own cost, from the same table wire() and the parent read, so
+	// nothing downstream can disagree about the names. An attempt that was billed
+	// and then discarded because its answer was unusable carries its tokens here
+	// and is the reason the failover accounting is worth exporting at all.
+	for _, a := range try.Usage.attrs() {
+		attrs = append(attrs, map[string]any{"key": a.key, "value": map[string]any{"intValue": strconv.Itoa(a.value)}})
+	}
+	// An attempt with no end never returned, so the request's end is the only
+	// moment it can be said to have stopped. That is true rather than measured,
+	// and it is preferred to a zero timestamp, which would place the span at the
+	// epoch, or to an equal start and end, which would claim it took no time.
+	end := try.End
+	if end == 0 {
+		end = e.End
+	}
+	span := map[string]any{
+		"traceId": e.TraceID, "spanId": try.SpanID, "parentSpanId": e.SpanID,
+		"name": sc.operation + " " + try.Model,
+		// CLIENT: the gateway is a server to its caller and a client to the
+		// provider, and the parent is the server half.
+		"kind":              3,
+		"startTimeUnixNano": strconv.FormatInt(try.Start, 10),
+		"endTimeUnixNano":   strconv.FormatInt(end, 10),
+		"attributes":        attrs,
+	}
+	if try.Status >= 400 || try.Fault != "" {
+		span["status"] = map[string]any{"code": 2}
+		// Same reasoning as the parent: Honeycomb reads error.type and ignores
+		// the span status, so a span carrying only a status is refused
+		// monitoring. The upstream status is the honest taxonomy where there is
+		// one; where the call never returned, the fault classification is what
+		// is actually known about why.
+		et := try.Fault
+		if try.Status >= 400 {
+			et = strconv.Itoa(try.Status)
+		}
+		span["attributes"] = append(span["attributes"].([]any),
+			map[string]any{"key": "error.type", "value": map[string]any{"stringValue": et}})
+	}
+	return span
+}
+
 func (t *Telemetry) spanOf(e Event) map[string]any {
-	sc := semconvOf(e.Provider)
 	// A request refused before any route was chosen is not a GenAI operation, and
 	// must not dress itself as one. Auth failures, policy refusals, rate-limit
 	// rejections and idempotent replays all reach here with no provider, and this
@@ -1561,16 +1658,15 @@ func (t *Telemetry) spanOf(e Event) map[string]any {
 	//
 	// The same gate the latency histogram uses: a provider is set once a route is
 	// picked, so its absence is exactly "this never reached a provider".
+	//
+	// It no longer carries gen_ai.* at all. This span is not a model call: it is
+	// the thing that chose one, possibly several times. The GenAI vocabulary
+	// moved to the attempt spans below, where each call's provider sits beside
+	// the tokens that call actually consumed. Leaving a copy here would have made
+	// any sum over gen_ai.usage.* count every attempt twice, and on a request
+	// with one attempt the child would have been an exact duplicate of its
+	// parent.
 	attrs := []any{}
-	if e.Provider != "" {
-		attrs = append(attrs,
-			map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": sc.provider}},
-			// Required by the convention on both the span and the token-usage
-			// metric, and previously absent -- which is what made these spans
-			// non-conformant rather than merely sparse, since it is the primary
-			// grouping key.
-			map[string]any{"key": "gen_ai.operation.name", "value": map[string]any{"stringValue": sc.operation}})
-	}
 	attrs = append(attrs,
 		map[string]any{"key": "http.response.status_code", "value": map[string]any{"intValue": strconv.Itoa(e.Status)}},
 		// What the routing loop decided, which the span used to drop on the floor.
@@ -1591,35 +1687,21 @@ func (t *Telemetry) spanOf(e Event) map[string]any {
 		attrs = append(attrs, map[string]any{"key": "switchboard.policy_version",
 			"value": map[string]any{"intValue": strconv.FormatInt(e.PolicyVersion, 10)}})
 	}
-	if e.Model != "" {
-		attrs = append(attrs, map[string]any{"key": "gen_ai.request.model", "value": map[string]any{"stringValue": e.Model}})
-	}
 	if e.Fault != "" {
 		attrs = append(attrs, map[string]any{"key": "switchboard.fault", "value": map[string]any{"stringValue": e.Fault}})
 	}
-	// What the request cost, from the same table wire() reads, so the span and
-	// the control plane cannot disagree about the names.
-	for _, a := range e.Usage.attrs() {
-		attrs = append(attrs, map[string]any{"key": a.key, "value": map[string]any{"intValue": strconv.Itoa(a.value)}})
-	}
-	// "{gen_ai.operation.name} {gen_ai.request.model}", which the convention says
-	// a span name SHOULD be. The old name was switchboard.inference: correct
-	// about what this is and unreadable to anything that groups GenAI spans by
-	// the convention's shape.
+	// The name says what this span is, now that it is no longer pretending to be
+	// the model call. "{gen_ai.operation.name} {gen_ai.request.model}" moved to
+	// the attempt spans, where it is true of exactly one call; on a request that
+	// failed over it was never true of this one, which named the winner and
+	// carried both providers' tokens.
 	//
-	// Model is empty on a request refused before any route was chosen, and
-	// "chat " with a trailing space is not a name. Fall back to the operation
-	// alone, which is still the convention's first half rather than a third
-	// vocabulary.
-	// "{gen_ai.operation.name} {gen_ai.request.model}" only where an operation
-	// actually took place. Where none did, the span says what it is instead of
-	// borrowing a vocabulary it has no claim on.
-	name := "switchboard.refused"
-	if e.Provider != "" {
-		name = sc.operation
-		if e.Model != "" {
-			name += " " + e.Model
-		}
+	// switchboard.refused is kept for a request that reached no provider, because
+	// the distinction it draws -- the gateway answered this itself -- is the one
+	// that stops an auth failure being counted as a model call.
+	name := "switchboard.route"
+	if e.Provider == "" {
+		name = "switchboard.refused"
 	}
 	span := map[string]any{"traceId": e.TraceID, "spanId": e.SpanID, "name": name, "kind": 2, "startTimeUnixNano": strconv.FormatInt(e.Start, 10), "endTimeUnixNano": strconv.FormatInt(e.End, 10), "attributes": attrs}
 	if e.ParentID != "" {
@@ -1663,7 +1745,7 @@ func (t *Telemetry) spanOf(e Event) map[string]any {
 // exportOTLP sends a single span. Kept for the tests that assert on one span's
 // shape; the serving path batches through exportOTLPBatch.
 func (t *Telemetry) exportOTLP(ctx context.Context, e Event) {
-	t.postSpans(ctx, []any{t.spanOf(e)})
+	t.postSpans(ctx, t.spansOf(e))
 }
 
 func (t *Telemetry) postSpans(ctx context.Context, spans []any) {

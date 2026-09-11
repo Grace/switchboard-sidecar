@@ -699,7 +699,43 @@ func TestOTLPHeaderWithEmptyEnvIsNotSent(t *testing.T) {
 // spanAttrs decodes one exported span's attributes into a name/value map. Only
 // the two value kinds these spans use are handled; anything else would be a new
 // attribute type and should fail loudly here rather than read as absent.
+
+// attemptAttrs returns the attributes of the nth exported attempt span.
+//
+// Separate from spanAttrs, which returns the first span -- now the routing span
+// -- because the two carry deliberately different vocabularies: the parent says
+// what the gateway decided, the children say what each provider was asked.
+func attemptAttrs(t *testing.T, body []byte, n int) (map[string]string, map[string]any) {
+	t.Helper()
+	spans := exportedSpans(t, body)
+	if len(spans) < n+2 {
+		t.Fatalf("wanted attempt span %d, got %d spans: %s", n, len(spans), body)
+	}
+	// Index 0 is the routing span; attempts follow in the order they were made.
+	return attrsOf(t, spans[n+1]), spans[n+1]
+}
+
+// routedEvent builds the event one upstream call produces, through the same
+// calls server.go makes. Filling the fields in by hand would let this test agree
+// with a spanOf that read them in a way the routing loop never writes them.
+func routedEvent(provider, model string, status int, fault string, u tokenUsage) Event {
+	e := Event{ID: "a", TraceID: "t", SpanID: "s", Start: 1, End: 2, Status: status}
+	e.Attempts = 1
+	e.Provider, e.Model, e.Fault = provider, model, fault
+	e.beginTry(provider, model, 1, "c1")
+	e.recordUsage(u)
+	e.endTry(status, fault, 2)
+	return e
+}
+
 func spanAttrs(t *testing.T, body []byte) (map[string]string, map[string]any) {
+	t.Helper()
+	spans := exportedSpans(t, body)
+	return attrsOf(t, spans[0]), spans[0]
+}
+
+// exportedSpans decodes every span in an OTLP/JSON body, in the order sent.
+func exportedSpans(t *testing.T, body []byte) []map[string]any {
 	t.Helper()
 	var b struct {
 		ResourceSpans []struct {
@@ -715,7 +751,11 @@ func spanAttrs(t *testing.T, body []byte) (map[string]string, map[string]any) {
 		len(b.ResourceSpans[0].ScopeSpans[0].Spans) == 0 {
 		t.Fatalf("no span exported: %s", body)
 	}
-	span := b.ResourceSpans[0].ScopeSpans[0].Spans[0]
+	return b.ResourceSpans[0].ScopeSpans[0].Spans
+}
+
+func attrsOf(t *testing.T, span map[string]any) map[string]string {
+	t.Helper()
 	out := map[string]string{}
 	for _, a := range span["attributes"].([]any) {
 		m := a.(map[string]any)
@@ -729,7 +769,7 @@ func spanAttrs(t *testing.T, body []byte) (map[string]string, map[string]any) {
 			t.Fatalf("attribute %q has an unhandled value kind: %v", m["key"], v)
 		}
 	}
-	return out, span
+	return out
 }
 
 // Honeycomb's error-rate detection reads error.type, error.message,
@@ -787,19 +827,35 @@ func TestSpanCarriesRoutingDecision(t *testing.T) {
 	// A request that succeeded on its third provider after an account refusal:
 	// status 200 with a fault set is not a contradiction, it is the case worth
 	// being able to see.
-	tel.exportOTLP(context.Background(), Event{
-		ID: "a", TraceID: "t", SpanID: "s", Provider: "bedrock", Model: "claude-sonnet-4",
-		Status: 200, Attempts: 3, Fault: faultAccount.String(), Start: 1, End: 2,
-	})
+	e := routedEvent("bedrock", "claude-sonnet-4", 200, faultAccount.String(), tokenUsage{})
+	e.Attempts = 3
+	tel.exportOTLP(context.Background(), e)
+	// The routing facts stay on the parent: they describe the decision, not any
+	// one call.
 	attrs, _ := spanAttrs(t, got)
 	for k, want := range map[string]string{
-		"gen_ai.provider.name": "aws.bedrock",
-		"gen_ai.request.model": "claude-sonnet-4",
 		"switchboard.attempts": "3",
 		"switchboard.fault":    "account",
 	} {
 		if attrs[k] != want {
 			t.Errorf("%s = %q, want %q", k, attrs[k], want)
+		}
+	}
+	// And the parent must no longer claim to be the model call, or a sum over
+	// gen_ai.usage.* counts every attempt twice.
+	for _, k := range []string{"gen_ai.provider.name", "gen_ai.request.model", "gen_ai.usage.input_tokens"} {
+		if _, ok := attrs[k]; ok {
+			t.Errorf("the routing span carries %s; it belongs on the attempt", k)
+		}
+	}
+	try, _ := attemptAttrs(t, got, 0)
+	for k, want := range map[string]string{
+		"gen_ai.provider.name":    "aws.bedrock",
+		"gen_ai.request.model":    "claude-sonnet-4",
+		"switchboard.attempt.seq": "1",
+	} {
+		if try[k] != want {
+			t.Errorf("attempt %s = %q, want %q", k, try[k], want)
 		}
 	}
 }
@@ -832,11 +888,8 @@ func TestProviderNamesMatchSemconvEnum(t *testing.T) {
 			}))
 			defer srv.Close()
 			tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
-			tel.exportOTLP(context.Background(), Event{
-				ID: "a", TraceID: "t", SpanID: "s", Provider: c.provider,
-				Model: "m", Status: 200, Start: 1, End: 2,
-			})
-			attrs, span := spanAttrs(t, got)
+			tel.exportOTLP(context.Background(), routedEvent(c.provider, "m", 200, "", tokenUsage{}))
+			attrs, span := attemptAttrs(t, got, 0)
 			if attrs["gen_ai.provider.name"] != c.wantProvider {
 				t.Errorf("gen_ai.provider.name = %q, want %q", attrs["gen_ai.provider.name"], c.wantProvider)
 			}
@@ -851,9 +904,13 @@ func TestProviderNamesMatchSemconvEnum(t *testing.T) {
 	}
 }
 
-// A request refused before any route was chosen carries no model, and the span
-// name is the operation alone rather than one with a trailing space.
-func TestSpanNameWithoutModel(t *testing.T) {
+// The routing span names itself rather than the operation it routed.
+//
+// It used to be called "{operation} {model}" after the attempt that answered,
+// which on a failover was a name true of one of several calls and attached to
+// the total of all of them. That name moved to the attempt spans, where it
+// describes exactly one call.
+func TestRoutingSpanNamesItself(t *testing.T) {
 	var got []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got, _ = io.ReadAll(r.Body)
@@ -861,12 +918,134 @@ func TestSpanNameWithoutModel(t *testing.T) {
 	}))
 	defer srv.Close()
 	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
-	tel.exportOTLP(context.Background(), Event{
-		ID: "a", TraceID: "t", SpanID: "s", Provider: "openai",
-		Status: 403, Start: 1, End: 2,
-	})
-	if _, span := spanAttrs(t, got); span["name"] != "chat" {
-		t.Errorf("span name = %q, want %q", span["name"], "chat")
+	tel.exportOTLP(context.Background(), routedEvent("openai", "m", 403, "", tokenUsage{}))
+	if _, span := spanAttrs(t, got); span["name"] != "switchboard.route" {
+		t.Errorf("routing span name = %q, want %q", span["name"], "switchboard.route")
+	}
+	if _, span := attemptAttrs(t, got, 0); span["name"] != "chat m" {
+		t.Errorf("attempt span name = %q, want %q", span["name"], "chat m")
+	}
+}
+
+// The defect this whole shape exists to fix.
+//
+// A request that spent 486 input tokens at OpenAI, failed over, and spent 612 at
+// Anthropic used to export one span reading anthropic / 1,098 input tokens.
+// Anthropic consumed 612. Every backend that groups cost by
+// gen_ai.provider.name inherited that, and conformance_test.go could never have
+// caught it, because every key was spelled correctly -- it is an attribution
+// defect, not a vocabulary one.
+//
+// The numbers below are deliberately different from each other and from their
+// sum, so that a span carrying the total instead of its own share cannot pass.
+func TestAttemptSpansCarryTheirOwnCost(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+
+	e := Event{ID: "a", TraceID: "t", SpanID: "s", Start: 1, End: 9, Status: 200}
+	e.Attempts++
+	e.Provider, e.Model = "openai", "gpt-4o-mini"
+	e.beginTry("openai", "gpt-4o-mini", 1, "c1")
+	e.recordUsage(tokenUsage{Input: 486, Output: 0})
+	e.endTry(502, "degraded", 4)
+	e.Attempts++
+	e.Provider, e.Model = "anthropic", "claude-sonnet-4"
+	e.beginTry("anthropic", "claude-sonnet-4", 5, "c2")
+	e.recordUsage(tokenUsage{Input: 612, Output: 308})
+	e.endTry(200, "", 9)
+	tel.exportOTLP(context.Background(), e)
+
+	spans := exportedSpans(t, got)
+	if len(spans) != 3 {
+		t.Fatalf("got %d spans, want a routing span and two attempts", len(spans))
+	}
+
+	for i, want := range []struct{ provider, model, input string }{
+		{"openai", "gpt-4o-mini", "486"},
+		{"anthropic", "claude-sonnet-4", "612"},
+	} {
+		attrs, span := attemptAttrs(t, got, i)
+		if attrs["gen_ai.provider.name"] != want.provider {
+			t.Errorf("attempt %d provider = %q, want %q", i, attrs["gen_ai.provider.name"], want.provider)
+		}
+		if attrs["gen_ai.request.model"] != want.model {
+			t.Errorf("attempt %d model = %q, want %q", i, attrs["gen_ai.request.model"], want.model)
+		}
+		// 1098 here would be the original defect, restored.
+		if attrs["gen_ai.usage.input_tokens"] != want.input {
+			t.Errorf("attempt %d input tokens = %q, want %q -- an attempt must carry what it "+
+				"consumed, not the request's total", i, attrs["gen_ai.usage.input_tokens"], want.input)
+		}
+		if span["parentSpanId"] != "s" {
+			t.Errorf("attempt %d parentSpanId = %v, want the routing span", i, span["parentSpanId"])
+		}
+	}
+
+	// The failed attempt was billed and produced nothing usable. That is the
+	// accounting point, and it is only visible because the attempt has a span.
+	failed, _ := attemptAttrs(t, got, 0)
+	if failed["error.type"] != "502" {
+		t.Errorf("the failed attempt's error.type = %q, want %q", failed["error.type"], "502")
+	}
+
+	// And the total lives nowhere on the routing span, so summing usage across a
+	// trace counts 1,098 once rather than twice.
+	parent, _ := spanAttrs(t, got)
+	for k := range parent {
+		if strings.HasPrefix(k, "gen_ai.") {
+			t.Errorf("the routing span carries %s; every gen_ai.* belongs on an attempt", k)
+		}
+	}
+}
+
+// An attempt that never came back: a timeout, a cancelled context, a connection
+// that failed. It has a span because beginTry minted one, and the span must not
+// invent the two things nobody measured.
+//
+// Writing 0 for the status would claim an HTTP status that was never received,
+// and writing 0 for the end would place the span at the epoch. Both are the
+// blank-versus-zero mistake this repository has now made twice elsewhere: once
+// where /v1/requests reported an absent token count as zero, and once where a
+// nil slice reached a page as JSON null.
+func TestAnAttemptThatNeverReturnedClaimsNothing(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+
+	// beginTry and then nothing: no endTry, which is what every exit path that
+	// never gets a response leaves behind.
+	e := Event{ID: "a", TraceID: "t", SpanID: "s", Start: 1, End: 42, Status: 504}
+	e.Attempts++
+	e.Provider, e.Model = "openai", "gpt-4o-mini"
+	e.beginTry("openai", "gpt-4o-mini", 7, "c1")
+	tel.exportOTLP(context.Background(), e)
+
+	attrs, span := attemptAttrs(t, got, 0)
+	if v, ok := attrs["http.response.status_code"]; ok {
+		t.Errorf("http.response.status_code = %q on an attempt that never returned one", v)
+	}
+	// It is still a GenAI call that was made, so it still says who it was made to.
+	if attrs["gen_ai.provider.name"] != "openai" {
+		t.Errorf("gen_ai.provider.name = %q, want %q", attrs["gen_ai.provider.name"], "openai")
+	}
+	// The request's end is the only moment this attempt can be said to have
+	// stopped. That is true rather than measured, and both alternatives are
+	// false: 0 puts the span at the epoch, and reusing the start claims it took
+	// no time.
+	if span["endTimeUnixNano"] != "42" {
+		t.Errorf("endTimeUnixNano = %v, want the request's end", span["endTimeUnixNano"])
+	}
+	if span["startTimeUnixNano"] != "7" {
+		t.Errorf("startTimeUnixNano = %v, want the attempt's own start", span["startTimeUnixNano"])
 	}
 }
 
@@ -997,12 +1176,15 @@ func TestSingleSpanExportStillWorks(t *testing.T) {
 	}))
 	defer srv.Close()
 	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
-	tel.exportOTLP(context.Background(), Event{ID: "a", TraceID: "t", SpanID: "s",
-		Provider: "openai", Status: 503, Start: 1, End: 2})
+	tel.exportOTLP(context.Background(), routedEvent("openai", "m", 503, "", tokenUsage{}))
 
 	attrs, _ := spanAttrs(t, got)
-	if attrs["error.type"] != "503" || attrs["gen_ai.provider.name"] != "openai" {
-		t.Errorf("single-span export lost attributes: %v", attrs)
+	if attrs["error.type"] != "503" {
+		t.Errorf("single-span export lost the routing span's attributes: %v", attrs)
+	}
+	try, _ := attemptAttrs(t, got, 0)
+	if try["gen_ai.provider.name"] != "openai" {
+		t.Errorf("single-span export lost the attempt span: %v", try)
 	}
 }
 
@@ -1018,14 +1200,11 @@ func TestSpanCarriesTokenUsage(t *testing.T) {
 	}))
 	defer srv.Close()
 	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
-	tel.exportOTLP(context.Background(), Event{
-		ID: "a", TraceID: "t", SpanID: "s", Provider: "anthropic", Model: "claude-haiku-4-5",
-		Status: 200, Start: 1, End: 2,
-		// Anthropic's worked example: a 50-token message against a 100,000-token
-		// warm cache. Input is the total; the parts are inside it.
-		Usage: tokenUsage{Input: 100050, Output: 7, CacheRead: 100000},
-	})
-	attrs, _ := spanAttrs(t, got)
+	// Anthropic's worked example: a 50-token message against a 100,000-token
+	// warm cache. Input is the total; the parts are inside it.
+	tel.exportOTLP(context.Background(), routedEvent("anthropic", "claude-haiku-4-5", 200, "",
+		tokenUsage{Input: 100050, Output: 7, CacheRead: 100000}))
+	attrs, _ := attemptAttrs(t, got, 0)
 	for k, want := range map[string]string{
 		"gen_ai.usage.input_tokens":            "100050",
 		"gen_ai.usage.output_tokens":           "7",
